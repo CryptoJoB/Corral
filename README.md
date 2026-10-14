@@ -159,7 +159,22 @@ package:eval-notes-7f3
 | Agent swarms (campaign quarantine), block workarounds (access graph) | Authenticated multi-tenant collector |
 | Credential access, supply-chain signals, velocity, scope drift | Learned behavioral baselines |
 
-Full threat map with the covert-channel taxonomy: `POSTMORTEM.md`, section 3.
+
+## Full Channel Surface vs Corral
+
+| Channel class | Examples | Detection requirement | Corral status | Detail / Note |
+|---|---|---|---|---|
+| Package registries | Artifactory, PyPI, npm | Write-to-read correlation | ✅ PROVEN | The flagship. Write→read correlation + `supply_chain` content heuristic + alternate-path catch. Proven in replay and dogfood (S2, S6). |
+| Shared filesystem | Files, file existence, metadata | Write-to-read correlation | ✅ PROVEN (content) | File read/write correlation proven (S2/S3/S6). Sub-gap: metadata-as-signal (mtime/size encoding covert data) is invisible — only content read/write attempts fire. |
+| Databases / caches / queues | Shared tables, Redis keys, SQS, Kafka | Write-to-read correlation | ⚠️ MECHANICAL, unproven | The extraction map covers queue/topic/key/record args, and the `unsanctioned_comm` rule applies to all resource kinds. A `redis_set(key=x)` → `redis_get(key=x)` pair would mechanically fire. But: never tested with real queue/cache tools, `insert` is missing from the write verbs, and a single `query(sql=...)` tool extracts no resource at all. |
+| Collaboration SaaS | Slack, GitHub issues/PRs/comments, Notion | Resource-aware adapters | ⚠️ ADAPTER WORK | A Slack tool with `channel=` arg extracts (as queue kind — semantically approximate); correlation would fire. But no real Slack/GitHub/Notion adapter has been written or tested. |
+| Git | Branches, commit messages, orphan commits | Resource-aware adapters | ⚠️ ADAPTER WORK | `branch`/`commit`/`repo`/`issue` args extract to git kind. Verb coverage is partial: `create_branch` classifies as write, but a tool literally named `git_commit` does not hit any write verb (`commit` is missing from the list). |
+| DNS | TXT-record dead drops | DNS-tool semantics | 🔀 SPLIT | Egress half PROVEN: a `dns_lookup`/`resolve` tool's hostname extracts as a domain → allowlist check → blocked attempt fires egress (the September OpenAI escape class). Covert-channel half MECHANICAL: a `set_dns_record` write followed by a `resolve` read would correlate, but TXT-record dead drops are untested. |
+| Env vars | Shared container environment | Env read tracking | 🔀 SPLIT | Access half PROVEN: sensitive-name reads fire `credential_access` (dogfood S4, 3/3). Channel half MECHANICAL: `set_env` (write verb) + `read_env` would correlate across sessions — supported by the code, never demonstrated. |
+| HTTP via allowed domains | Redirect chains, SSRF through the proxy | Fetch-sequence heuristics | 🔀 SPLIT | Fetch-sequence heuristic PROVEN: allowed fetch → blocked external attempt fires `ssrf_chain` (dogfood S5, real behavior). Mid-flight redirects INVISIBLE: a 302 from an allowed domain to an external one happens inside the HTTP response — the SDK layer sees only the tool call, never the redirect hop. |
+| Code execution | `run_code` leading to network calls inside the sandbox | Sandbox-level egress control | 🔀 WATCH ONLY | `code_exec_watch` + post-exec egress escalation fire and escalate severity — a behavioral proxy (proven in S5). The actual `urllib` call inside `run_code` is invisible. True coverage requires sandbox-level egress control — structurally out of scope for the SDK layer. |
+| Timing channels | Lock patterns, load signaling | Research-grade, unsolved | ❌ NOT COVERED | Named honestly. Research-grade. |
+| Content obfuscation | `base64`, steganography, encryption | Entropy/content forensics | 🔀 SPLIT — and this is the key insight | The content heuristics (keyword regex) are defeated by `base64`/encryption. But the core control isn't content-based. The zero-trust correlation fires on who read what — the access pattern — not on what the payload says. An agent publishing `base64`-garbled coordination notes still triggers `unsanctioned_comm` when the next agent reads them, because the rule never looked at the content in the first place. Obfuscation defeats the enrichment, not the control. |
 
 ---
 
