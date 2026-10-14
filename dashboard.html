@@ -1,0 +1,219 @@
+<!doctype html><html><head><meta charset="utf-8">
+<title>Corral — Autonomous Agent Defense</title>
+<style>
+ *{box-sizing:border-box}
+ body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,monospace;margin:0;padding:16px;min-height:100vh}
+ h1{font-size:16px;color:#58a6ff;margin:0 0 2px}.sub{color:#8b949e;font-size:11px}
+ #hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;flex-wrap:wrap;gap:8px}
+ .stats{display:flex;gap:18px;flex-wrap:wrap}.stat b{display:block;font-size:20px;color:#58a6ff;font-weight:600}
+ .stat span{font-size:10px;color:#8b949e;text-transform:uppercase}
+ .stat.warn b{color:#f85149}
+ .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+ @media(max-width:900px){.grid{grid-template-columns:1fr}}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;min-width:0;overflow:auto;max-height:460px}
+ .card h2{font-size:11px;color:#8b949e;margin:0 0 8px;text-transform:uppercase;letter-spacing:.5px}
+ table{width:100%;border-collapse:collapse;table-layout:fixed}
+ th{color:#8b949e;border-bottom:1px solid #30363d;font-weight:600;position:sticky;top:0;background:#161b22;z-index:1}
+ td{border-bottom:1px solid #21262d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ th,td{padding:3px 6px;font-size:11px;text-align:left}
+ .flag{color:#f85149}.ok{color:#3fb950}.susp{color:#d29922}
+ .sev{padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;white-space:nowrap}
+ .sev-high,.sev-critical{background:#3d1418;color:#f85149}
+ .sev-medium{background:#2d2205;color:#d29922}.sev-low{background:#0f2e1d;color:#3fb950}
+ .inc{border:1px solid #30363d;border-radius:6px;padding:8px;margin-bottom:8px}
+ .inchdr{display:flex;gap:10px;align-items:baseline;font-size:12px;flex-wrap:wrap}
+ .contain{color:#58a6ff;font-weight:700}
+ details{margin-top:6px}summary{cursor:pointer;color:#58a6ff;font-size:11px}
+ .md{margin-top:6px;font-size:12px;line-height:1.6;overflow:auto}
+ .md h1{font-size:15px;margin:8px 0 4px}.md h2{font-size:12px;color:#8b949e;margin:10px 0 4px;text-transform:none}
+ .md table{margin:6px 0;table-layout:auto}.md td,.md th{white-space:normal;overflow:visible}
+ .md code{background:#0d1117;padding:1px 4px;border-radius:3px;color:#79c0ff}
+ .md li{margin-left:18px;list-style:disc}.md ol li{list-style:decimal}
+ .md hr{border:0;border-top:1px solid #30363d}
+ button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 10px;cursor:pointer;font:inherit}
+ button:hover{border-color:#58a6ff}
+ .kill{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}
+ .kill:hover{background:#5a1d22;border-color:#f85149}
+ .killall{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:4px 14px;cursor:pointer;font:inherit;font-weight:700;width:100%;margin-top:8px}
+ .killall:hover{background:#5a1d22;border-color:#f85149}
+ .resume{background:#0f2e1d;color:#3fb950;border:1px solid #1d5c38;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}
+ .resume:hover{border-color:#3fb950}
+ .blk{margin:3px 0;font-size:12px}
+ .lnk{margin:3px 0;font-size:12px}
+ .empty{color:#8b949e;font-size:11px}
+</style></head><body>
+<div id="hdr"><div><h1>⬡ Corral</h1>
+<div class="sub">Autonomous defense for AI agent fleets · v0.4</div></div>
+<div class="stats">
+ <div class="stat"><b id="n-sess">0</b><span>sessions</span></div>
+ <div class="stat"><b id="n-ev">0</b><span>events</span></div>
+ <div class="stat warn"><b id="n-inc">0</b><span>incidents</span></div>
+ <div class="stat"><b id="n-cont">—</b><span>mean containment</span></div>
+ <div class="stat warn"><b id="n-blk">0</b><span>blocked</span></div>
+ <div class="stat warn"><b id="n-susp">0</b><span>suspended</span></div>
+</div></div>
+<div class="grid">
+ <div class="card"><h2>Sessions</h2>
+   <table>
+    <thead><tr><th style="width:52%">Agent</th><th style="width:24%">Status</th><th style="width:24%">Control</th></tr></thead>
+    <tbody id="sessions-body"></tbody>
+   </table>
+   <button class="killall" onclick="suspendAll()">⏸ SUSPEND ALL AGENTS</button>
+ </div>
+ <div class="card"><h2>Event Stream</h2>
+   <table>
+    <thead><tr>
+     <th style="width:11%">Time</th><th style="width:15%">Agent</th><th style="width:15%">Action</th>
+     <th style="width:21%">Resource</th><th style="width:12%">Outcome</th><th style="width:26%">Flags</th>
+    </tr></thead>
+    <tbody id="events-body"></tbody>
+   </table>
+ </div>
+ <div class="card"><h2>Incidents</h2><div id="incidents"></div></div>
+ <div class="card"><h2>Blocked Resources</h2><div id="blocksCard"></div>
+   <div class="sub" style="margin-top:6px">defender blocks auto-expire (CORRAL_BLOCK_TTL); click unblock to clear now</div></div>
+ <div class="card"><h2>CommPolicy — Sanctioned Links</h2>
+   <div id="policy"></div>
+   <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap">
+     <input id="pw" placeholder="writer glob" style="flex:1;min-width:110px">
+     <input id="pr" placeholder="reader glob" style="flex:1;min-width:110px">
+     <input id="pf" placeholder="resource pattern" style="flex:1.4;min-width:150px">
+     <button onclick="addLink()">add</button>
+   </div>
+   <div class="sub" style="margin-top:6px">zero-trust default: every cross-session read-after-write flags unless matched above</div>
+ </div>
+</div>
+<script>
+const esc = s => String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function md(src){
+  const lines = esc(src).split('\n'); let out=[], i=0;
+  const inline = t => t
+    .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g,'<em>$1</em>')
+    .replace(/`([^`]+)`/g,'<code>$1</code>');
+  while(i<lines.length){
+    let L=lines[i];
+    if(/^#{1,3}\s/.test(L)){const n=L.match(/^#+/)[0].length;
+      out.push(`<h${n+1} class="md">${inline(L.slice(n+1))}</h${n+1}>`);i++;continue}
+    if(/^---+$/.test(L.trim())){out.push('<hr>');i++;continue}
+    if(L.trim().startsWith('|')&&i+1<lines.length&&/^\|[\s:|-]+\|?$/.test(lines[i+1].trim())){
+      const rows=[L];i+=2;
+      while(i<lines.length&&lines[i].trim().startsWith('|')){rows.push(lines[i]);i++}
+      const cells=r=>r.trim().replace(/^\||\|$/g,'').split('|').map(inline);
+      out.push('<table><tr>'+cells(rows[0]).map(c=>`<th>${c}</th>`).join('')+'</tr>'
+        +rows.slice(1).map(r=>'<tr>'+cells(r).map(c=>`<td>${c}</td>`).join('')+'</tr>').join('')+'</table>');
+      continue}
+    if(/^[-*]\s/.test(L)){const items=[];while(i<lines.length&&/^[-*]\s/.test(lines[i]))
+      {items.push(inline(lines[i].slice(2)));i++}
+      out.push('<ul>'+items.map(x=>`<li>${x}</li>`).join('')+'</ul>');continue}
+    if(/^\d+\.\s/.test(L)){const items=[];while(i<lines.length&&/^\d+\.\s/.test(lines[i]))
+      {items.push(inline(lines[i].replace(/^\d+\.\s/,'')));i++}
+      out.push('<ol>'+items.map(x=>`<li>${x}</li>`).join('')+'</ol>');continue}
+    if(L.trim()===''){i++;continue}
+    out.push(`<p>${inline(L)}</p>`);i++;
+  }
+  return out.join('');
+}
+let policyLinks=[], _blocks=[], _sessions=[];
+function postPolicy(){
+  fetch('/comm_policy',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({links:policyLinks})});
+}
+function addLink(){
+  const w=document.getElementById('pw').value.trim(),
+        r=document.getElementById('pr').value.trim(),
+        f=document.getElementById('pf').value.trim();
+  if(!w||!r||!f) return;
+  policyLinks.push({writer:w,reader:r,resource:f,note:''});
+  postPolicy(); renderPolicy();
+  document.getElementById('pw').value='';
+  document.getElementById('pr').value='';
+  document.getElementById('pf').value='';
+}
+function removeLink(i){policyLinks.splice(i,1);postPolicy();renderPolicy();}
+function renderPolicy(){
+  document.getElementById('policy').innerHTML = policyLinks.map((l,i)=>
+   `<div class="lnk"><span class="ok">✓</span> ${esc(l.writer)} → ${esc(l.reader)} via <code>${esc(l.resource)}</code>
+    <button onclick="removeLink(${i})">remove</button></div>`).join('')
+   || '<span class="empty">none — all cross-session communication flags</span>';
+}
+function unblockIdx(i){
+  const b=_blocks[i]; if(!b) return;
+  fetch('/blocks?kind='+encodeURIComponent(b.kind)+'&value='+encodeURIComponent(b.value),{method:'DELETE'});
+}
+function suspendIdx(i){
+  const s=_sessions[i]; if(!s) return;
+  if(s.status==='suspended') return;
+  fetch('/sessions/'+encodeURIComponent(s.session_id)+'/suspend',{method:'POST'});
+}
+function resumeIdx(i){
+  const s=_sessions[i]; if(!s) return;
+  if(s.status!=='suspended') return;
+  fetch('/sessions/'+encodeURIComponent(s.session_id)+'/resume',{method:'POST'});
+}
+function suspendAll(){
+  if(!confirm('Suspend ALL active agent sessions?')) return;
+  _sessions.forEach(s=>{
+    if(s.status!=='suspended')
+      fetch('/sessions/'+encodeURIComponent(s.session_id)+'/suspend',{method:'POST'});
+  });
+}
+async function poll(){
+ try{
+  const [ses,evs,inc,bl,pol]=await Promise.all([
+   fetch('/sessions').then(r=>r.json()),
+   fetch('/events?limit=60').then(r=>r.json()),
+   fetch('/incidents').then(r=>r.json()),
+   fetch('/blocks').then(r=>r.json()),
+   fetch('/comm_policy').then(r=>r.json())]);
+  _sessions=ses.sessions||[];
+  document.getElementById('n-sess').textContent=_sessions.length;
+  document.getElementById('n-ev').textContent=evs.events.length;
+  document.getElementById('n-inc').textContent=inc.incidents.length;
+  const nSusp=_sessions.filter(s=>s.status==='suspended').length;
+  document.getElementById('n-susp').textContent=nSusp;
+  const cs=inc.incidents.filter(i=>i.started>0).map(i=>i.created-i.started);
+  document.getElementById('n-cont').textContent=cs.length?
+    (cs.reduce((a,b)=>a+b,0)/cs.length).toFixed(2)+'s':'—';
+  _blocks=bl.blocks||[];
+  document.getElementById('n-blk').textContent=_blocks.length;
+
+  document.getElementById('sessions-body').innerHTML=_sessions.map((s,i)=>{
+    const susp=s.status==='suspended';
+    return `<tr><td title="${esc(s.agent_id)}">${esc(s.agent_id)}</td>
+     <td>${susp?'<span class="susp">SUSPENDED</span>':'<span class="ok">active</span>'}</td>
+     <td>${susp
+       ?`<button class="resume" onclick="resumeIdx(${i})">resume</button>`
+       :`<button class="kill" onclick="suspendIdx(${i})">SUSPEND</button>`}</td></tr>`;
+  }).join('')||'<tr><td colspan="3" class="empty">none</td></tr>';
+
+  document.getElementById('events-body').innerHTML=evs.events.slice(-40).reverse().map(e=>{
+    const res=e.resource?esc(e.resource.kind+':'+e.resource.value):'—';
+    return `<tr><td title="${new Date(e.ts*1000).toLocaleString()}">${new Date(e.ts*1000).toLocaleTimeString()}</td>
+     <td title="${esc(e.agent_id)}">${esc(e.agent_id)}</td>
+     <td title="${esc(e.tool)}">${esc(e.tool)}</td>
+     <td title="${res}">${res}</td>
+     <td class="${e.outcome==='blocked'?'flag':'ok'}">${e.outcome}</td>
+     <td class="flag" title="${esc(e.flags.join(', '))}">${esc(e.flags.join(','))||'—'}</td></tr>`;
+  }).join('')||'<tr><td colspan="6" class="empty">none</td></tr>';
+
+  document.getElementById('blocksCard').innerHTML=_blocks.map((b,i)=>
+   `<div class="blk"><span class="susp">⛔</span> ${esc(b.kind)}:${esc(b.value)}
+    <span class="sub">${esc(b.reason||'')}</span>
+    <button onclick="unblockIdx(${i})">unblock</button></div>`).join('')
+   ||'<span class="empty">none</span>';
+  policyLinks=pol.links||[]; renderPolicy();
+
+  document.getElementById('incidents').innerHTML=inc.incidents.map(i=>{
+   const v=i.verdict, c=(i.created-i.started).toFixed(2);
+   return `<div class="inc"><div class="inchdr">
+    <span class="sev sev-${esc(v.severity)}">${esc(v.severity.toUpperCase())}</span>
+    <b>${esc(v.threat_class)}</b><span class="sub">${esc(i.session_ids.join(', '))}</span>
+    <span class="contain">contained in ${c}s</span></div>
+    <details><summary>incident report</summary>
+    <div class="md">${md(i.report_md||'')}</div></details></div>`}).join('')
+    ||'<span class="empty">none</span>';
+ }catch(e){}
+}
+poll();setInterval(poll,1500);
+</script></body></html>

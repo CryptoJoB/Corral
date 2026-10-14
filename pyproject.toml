@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "corral"
+version = "0.4.1"
+description = "Autonomous defense for AI agent fleets — single file, zero-trust inter-agent communication"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.5",
+    "httpx>=0.25",
+    "fastapi>=0.104",
+    "uvicorn>=0.24",
+]
+
+[project.scripts]
+corral = "corral:main"
+
+[tool.setuptools]
+py-modules = ["corral"]
