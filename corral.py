@@ -33,7 +33,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel, Field
 
-__version__ = "0.4.0"
+__version__ = "0.4.3"
 DEFAULT_URL = os.environ.get("CORRAL_URL", "http://127.0.0.1:7331")
 CORRAL_API_KEY = os.environ.get("CORRAL_API_KEY", "")
 BLOCK_TTL = float(os.environ.get("CORRAL_BLOCK_TTL", "3600"))
@@ -151,9 +151,9 @@ _RESOURCE_KEYS = {
     "branch": "git", "commit": "git", "repo": "git",
     "issue": "git", "comment": "git", "pr": "git",
     "record": "db", "table": "db", "row": "db",
+    "board": "queue", "board_name": "queue",
     "name": "package",  # fallback, checked LAST (dict order)
 }
-
 _DNS_TOOL_HINTS = ("dns", "resolve", "lookup")
 
 def extract_resource(tool: str, args: dict) -> Optional[Resource]:
@@ -597,10 +597,12 @@ class Store:
 
 _WRITE = ("publish", "write", "save", "upload", "post", "put", "create",
           "update", "send", "delete", "set", "push", "emit", "broadcast",
-          "notify", "reply", "comment", "store", "patch", "merge")
+          "notify", "reply", "comment", "store", "patch", "merge",
+          "insert", "commit", "open")
 _READ = ("fetch", "read", "get", "load", "download", "view", "search",
          "pull", "receive", "poll", "subscribe", "listen", "watch",
-         "check", "list", "query", "scan", "peek")
+         "check", "list", "query", "scan", "peek", "browse", "close",
+         "lookup", "resolve")
 _CODE_EXEC = ("run_code", "exec", "eval", "shell", "bash", "python",
               "subprocess", "terminal", "command")
 _SUSPICIOUS_CONTENT = re.compile(
@@ -1568,6 +1570,10 @@ def selftest() -> int:
     check("redact strips sensitive values",
           redact({"AWS_SECRET_ACCESS_KEY": "AKIA...", "query": "hi"},
                  SENSITIVE_DEFAULT)["AWS_SECRET_ACCESS_KEY"] == "[REDACTED]")
+    check("op_of verb-collision guard (read_file != write)",
+          op_of("read_file") == "read" and op_of("write_file") == "write"
+          and op_of("poll_queue") == "read"
+          and op_of("send_to_queue") == "write")
 
     print("--- end-to-end (in-process server on :7332) ---")
     db = os.path.join(OUT_DIR, "selftest.db")

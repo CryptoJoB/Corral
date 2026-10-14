@@ -17,6 +17,7 @@
  td{border-bottom:1px solid #21262d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
  th,td{padding:3px 6px;font-size:11px;text-align:left}
  .flag{color:#f85149}.ok{color:#3fb950}.susp{color:#d29922}
+ .warn{color:#d29922;font-weight:600}
  .sev{padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;white-space:nowrap}
  .sev-high,.sev-critical{background:#3d1418;color:#f85149}
  .sev-medium{background:#2d2205;color:#d29922}.sev-low{background:#0f2e1d;color:#3fb950}
@@ -41,6 +42,7 @@
  .blk{margin:3px 0;font-size:12px}
  .lnk{margin:3px 0;font-size:12px}
  .empty{color:#8b949e;font-size:11px}
+ .legend{margin-top:8px;font-size:10px;color:#8b949e}
 </style></head><body>
 <div id="hdr"><div><h1>⬡ Corral</h1>
 <div class="sub">Autonomous defense for AI agent fleets · v0.4</div></div>
@@ -68,6 +70,10 @@
     </tr></thead>
     <tbody id="events-body"></tbody>
    </table>
+   <div class="legend">outcome: <span class="ok">allowed</span> ·
+     <span class="warn">allowed + flagged</span> ·
+     <span class="flag">blocked</span> —
+     flags are behavioral detections, independent of the policy decision</div>
  </div>
  <div class="card"><h2>Incidents</h2><div id="incidents"></div></div>
  <div class="card"><h2>Blocked Resources</h2><div id="blocksCard"></div>
@@ -115,6 +121,11 @@ function md(src){
   return out.join('');
 }
 let policyLinks=[], _blocks=[], _sessions=[];
+// v0.4.4: preserve incident-report expansion across re-renders
+let openIncidents = new Set();
+function onIncToggle(id, isOpen){
+  if(isOpen) openIncidents.add(id); else openIncidents.delete(id);
+}
 function postPolicy(){
   fetch('/comm_policy',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({links:policyLinks})});
@@ -189,11 +200,16 @@ async function poll(){
 
   document.getElementById('events-body').innerHTML=evs.events.slice(-40).reverse().map(e=>{
     const res=e.resource?esc(e.resource.kind+':'+e.resource.value):'—';
+    const oc = e.outcome==='blocked' ? 'flag'
+             : (e.flags.length ? 'warn' : 'ok');
+    const ot = e.outcome==='blocked' ? 'denied by policy'
+             : (e.flags.length ? 'allowed by policy — flagged by detection rules'
+                               : 'clean');
     return `<tr><td title="${new Date(e.ts*1000).toLocaleString()}">${new Date(e.ts*1000).toLocaleTimeString()}</td>
      <td title="${esc(e.agent_id)}">${esc(e.agent_id)}</td>
      <td title="${esc(e.tool)}">${esc(e.tool)}</td>
      <td title="${res}">${res}</td>
-     <td class="${e.outcome==='blocked'?'flag':'ok'}">${e.outcome}</td>
+     <td class="${oc}" title="${ot}">${e.outcome}</td>
      <td class="flag" title="${esc(e.flags.join(', '))}">${esc(e.flags.join(','))||'—'}</td></tr>`;
   }).join('')||'<tr><td colspan="6" class="empty">none</td></tr>';
 
@@ -206,11 +222,13 @@ async function poll(){
 
   document.getElementById('incidents').innerHTML=inc.incidents.map(i=>{
    const v=i.verdict, c=(i.created-i.started).toFixed(2);
+   const openAttr = openIncidents.has(i.incident_id) ? 'open' : '';
    return `<div class="inc"><div class="inchdr">
     <span class="sev sev-${esc(v.severity)}">${esc(v.severity.toUpperCase())}</span>
     <b>${esc(v.threat_class)}</b><span class="sub">${esc(i.session_ids.join(', '))}</span>
     <span class="contain">contained in ${c}s</span></div>
-    <details><summary>incident report</summary>
+    <details ${openAttr} ontoggle="onIncToggle('${i.incident_id}', this.open)">
+    <summary>incident report</summary>
     <div class="md">${md(i.report_md||'')}</div></details></div>`}).join('')
     ||'<span class="empty">none</span>';
  }catch(e){}
