@@ -4,9 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "corral"
-version = "0.4.3"
+version = "0.5.5"
 description = "Autonomous defense for AI agent fleets — single file, zero-trust inter-agent communication"
+readme = "README.md"
 requires-python = ">=3.10"
+# NOTE: choose and add a license before publishing (license = {text = "..."}).
+# NOTE: the name "corral" collides with existing projects on PyPI and
+# GitHub — decide on the distribution name before `pip publish`.
 dependencies = [
     "pydantic>=2.5",
     "httpx>=0.25",
@@ -19,3 +23,5 @@ corral = "corral:main"
 
 [tool.setuptools]
 py-modules = ["corral"]
+# dashboard.html is embedded in corral.py (DASHBOARD_HTML); the external
+# file, when present next to corral.py, overrides it for development.

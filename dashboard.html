@@ -43,9 +43,11 @@
  .lnk{margin:3px 0;font-size:12px}
  .empty{color:#8b949e;font-size:11px}
  .legend{margin-top:8px;font-size:10px;color:#8b949e}
+ #authbar{display:none;background:#3d1418;border:1px solid #6e2a2e;border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:12px}
+ #authbar input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:3px 8px;font:inherit}
 </style></head><body>
 <div id="hdr"><div><h1>⬡ Corral</h1>
-<div class="sub">Autonomous defense for AI agent fleets · v0.4</div></div>
+<div class="sub">Autonomous defense for AI agent fleets · v0.5.5</div></div>
 <div class="stats">
  <div class="stat"><b id="n-sess">0</b><span>sessions</span></div>
  <div class="stat"><b id="n-ev">0</b><span>events</span></div>
@@ -54,6 +56,10 @@
  <div class="stat warn"><b id="n-blk">0</b><span>blocked</span></div>
  <div class="stat warn"><b id="n-susp">0</b><span>suspended</span></div>
 </div></div>
+<div id="authbar">⛔ Collector requires an admin key (CORRAL_API_KEY).
+ <input id="keyinput" type="password" placeholder="admin key">
+ <button onclick="saveKey()">unlock</button>
+ <span class="sub">stored in sessionStorage only, sent as X-Corral-Key</span></div>
 <div class="grid">
  <div class="card"><h2>Sessions</h2>
    <table>
@@ -72,13 +78,15 @@
    </table>
    <div class="legend">outcome: <span class="ok">allowed</span> ·
      <span class="warn">allowed + flagged</span> ·
-     <span class="flag">blocked</span> —
+     <span class="flag">blocked</span> ·
+     <span class="susp">halted</span> —
      flags are behavioral detections, independent of the policy decision</div>
  </div>
  <div class="card"><h2>Incidents</h2><div id="incidents"></div></div>
  <div class="card"><h2>Blocked Resources</h2><div id="blocksCard"></div>
-   <div class="sub" style="margin-top:6px">defender blocks auto-expire (CORRAL_BLOCK_TTL); click unblock to clear now</div></div>
+   <div class="sub" style="margin-top:6px">all blocks default to CORRAL_BLOCK_TTL expiry; click unblock to clear now</div></div>
  <div class="card"><h2>CommPolicy — Sanctioned Links</h2>
+   <div id="poldefault"></div>
    <div id="policy"></div>
    <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap">
      <input id="pw" placeholder="writer glob" style="flex:1;min-width:110px">
@@ -86,11 +94,35 @@
      <input id="pf" placeholder="resource pattern" style="flex:1.4;min-width:150px">
      <button onclick="addLink()">add</button>
    </div>
+   <div style="margin-top:6px;display:flex;gap:6px;align-items:center">
+     <span class="sub">default for unmatched cross-session reads:</span>
+     <button onclick="setDefault('flag')">flag</button>
+     <button onclick="setDefault('deny')">deny (veto synchronously)</button>
+   </div>
    <div class="sub" style="margin-top:6px">zero-trust default: every cross-session read-after-write flags unless matched above</div>
  </div>
 </div>
 <script>
 const esc = s => String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// v0.5: admin-key auth. The key lives in sessionStorage and is attached
+// to every call; a 401 surfaces the unlock bar instead of silently failing.
+function key(){return sessionStorage.getItem('corral_key')||''}
+function saveKey(){
+  sessionStorage.setItem('corral_key', document.getElementById('keyinput').value);
+  document.getElementById('authbar').style.display='none';
+  poll();
+}
+async function api(path, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers,
+    key() ? {'X-Corral-Key': key()} : {});
+  const r = await fetch(path, opts);
+  if(r.status === 401){
+    document.getElementById('authbar').style.display='block';
+    throw new Error('unauthorized');
+  }
+  return r;
+}
 function md(src){
   const lines = esc(src).split('\n'); let out=[], i=0;
   const inline = t => t
@@ -120,15 +152,18 @@ function md(src){
   }
   return out.join('');
 }
-let policyLinks=[], _blocks=[], _sessions=[];
+let policyLinks=[], policyDefault='flag', _blocks=[], _sessions=[];
 // v0.4.4: preserve incident-report expansion across re-renders
 let openIncidents = new Set();
-function onIncToggle(id, isOpen){
-  if(isOpen) openIncidents.add(id); else openIncidents.delete(id);
+// v0.5: the id travels in an escaped data attribute, never interpolated
+// into a JS string literal (stored-XSS fix)
+function onIncToggle(el){
+  const id = el.getAttribute('data-iid');
+  if(el.open) openIncidents.add(id); else openIncidents.delete(id);
 }
 function postPolicy(){
-  fetch('/comm_policy',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({links:policyLinks})});
+  api('/comm_policy',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({links:policyLinks, default:policyDefault})}).catch(()=>{});
 }
 function addLink(){
   const w=document.getElementById('pw').value.trim(),
@@ -142,7 +177,10 @@ function addLink(){
   document.getElementById('pf').value='';
 }
 function removeLink(i){policyLinks.splice(i,1);postPolicy();renderPolicy();}
+function setDefault(d){policyDefault=d;postPolicy();renderPolicy();}
 function renderPolicy(){
+  document.getElementById('poldefault').innerHTML =
+    `default: <b class="${policyDefault==='deny'?'flag':'ok'}">${esc(policyDefault)}</b>`;
   document.getElementById('policy').innerHTML = policyLinks.map((l,i)=>
    `<div class="lnk"><span class="ok">✓</span> ${esc(l.writer)} → ${esc(l.reader)} via <code>${esc(l.resource)}</code>
     <button onclick="removeLink(${i})">remove</button></div>`).join('')
@@ -150,33 +188,33 @@ function renderPolicy(){
 }
 function unblockIdx(i){
   const b=_blocks[i]; if(!b) return;
-  fetch('/blocks?kind='+encodeURIComponent(b.kind)+'&value='+encodeURIComponent(b.value),{method:'DELETE'});
+  api('/blocks?kind='+encodeURIComponent(b.kind)+'&value='+encodeURIComponent(b.value),{method:'DELETE'}).catch(()=>{});
 }
 function suspendIdx(i){
   const s=_sessions[i]; if(!s) return;
   if(s.status==='suspended') return;
-  fetch('/sessions/'+encodeURIComponent(s.session_id)+'/suspend',{method:'POST'});
+  api('/sessions/'+encodeURIComponent(s.session_id)+'/suspend',{method:'POST'}).catch(()=>{});
 }
 function resumeIdx(i){
   const s=_sessions[i]; if(!s) return;
   if(s.status!=='suspended') return;
-  fetch('/sessions/'+encodeURIComponent(s.session_id)+'/resume',{method:'POST'});
+  api('/sessions/'+encodeURIComponent(s.session_id)+'/resume',{method:'POST'}).catch(()=>{});
 }
 function suspendAll(){
   if(!confirm('Suspend ALL active agent sessions?')) return;
   _sessions.forEach(s=>{
     if(s.status!=='suspended')
-      fetch('/sessions/'+encodeURIComponent(s.session_id)+'/suspend',{method:'POST'});
+      api('/sessions/'+encodeURIComponent(s.session_id)+'/suspend',{method:'POST'}).catch(()=>{});
   });
 }
 async function poll(){
  try{
   const [ses,evs,inc,bl,pol]=await Promise.all([
-   fetch('/sessions').then(r=>r.json()),
-   fetch('/events?limit=60').then(r=>r.json()),
-   fetch('/incidents').then(r=>r.json()),
-   fetch('/blocks').then(r=>r.json()),
-   fetch('/comm_policy').then(r=>r.json())]);
+   api('/sessions').then(r=>r.json()),
+   api('/events?limit=60').then(r=>r.json()),
+   api('/incidents').then(r=>r.json()),
+   api('/blocks').then(r=>r.json()),
+   api('/comm_policy').then(r=>r.json())]);
   _sessions=ses.sessions||[];
   document.getElementById('n-sess').textContent=_sessions.length;
   document.getElementById('n-ev').textContent=evs.events.length;
@@ -201,8 +239,10 @@ async function poll(){
   document.getElementById('events-body').innerHTML=evs.events.slice(-40).reverse().map(e=>{
     const res=e.resource?esc(e.resource.kind+':'+e.resource.value):'—';
     const oc = e.outcome==='blocked' ? 'flag'
+             : e.outcome==='halted' ? 'susp'
              : (e.flags.length ? 'warn' : 'ok');
     const ot = e.outcome==='blocked' ? 'denied by policy'
+             : e.outcome==='halted' ? 'attempted while suspended'
              : (e.flags.length ? 'allowed by policy — flagged by detection rules'
                                : 'clean');
     return `<tr><td title="${new Date(e.ts*1000).toLocaleString()}">${new Date(e.ts*1000).toLocaleTimeString()}</td>
@@ -215,10 +255,10 @@ async function poll(){
 
   document.getElementById('blocksCard').innerHTML=_blocks.map((b,i)=>
    `<div class="blk"><span class="susp">⛔</span> ${esc(b.kind)}:${esc(b.value)}
-    <span class="sub">${esc(b.reason||'')}</span>
+    <span class="sub">${esc(b.reason||'')}${b.expires?' · expires '+new Date(b.expires*1000).toLocaleTimeString():' · permanent'}</span>
     <button onclick="unblockIdx(${i})">unblock</button></div>`).join('')
    ||'<span class="empty">none</span>';
-  policyLinks=pol.links||[]; renderPolicy();
+  policyLinks=pol.links||[]; policyDefault=pol.default||'flag'; renderPolicy();
 
   document.getElementById('incidents').innerHTML=inc.incidents.map(i=>{
    const v=i.verdict, c=(i.created-i.started).toFixed(2);
@@ -227,7 +267,7 @@ async function poll(){
     <span class="sev sev-${esc(v.severity)}">${esc(v.severity.toUpperCase())}</span>
     <b>${esc(v.threat_class)}</b><span class="sub">${esc(i.session_ids.join(', '))}</span>
     <span class="contain">contained in ${c}s</span></div>
-    <details ${openAttr} ontoggle="onIncToggle('${i.incident_id}', this.open)">
+    <details data-iid="${esc(i.incident_id)}" ${openAttr} ontoggle="onIncToggle(this)">
     <summary>incident report</summary>
     <div class="md">${md(i.report_md||'')}</div></details></div>`}).join('')
     ||'<span class="empty">none</span>';

@@ -2,41 +2,80 @@
 """
 corral — autonomous defense for AI agent fleets. Single file. Auditable.
 
-v0.4.0 "Recovery"
-  NEW  block lifecycle: defender blocks auto-expire (CORRAL_BLOCK_TTL,
-       default 3600s), DELETE /blocks unblocks immediately, dashboard
-       Blocked Resources panel with unblock buttons — the false-positive
-       recovery path proven necessary by dogfood S3
-  NEW  CommPolicy as config: auto-loaded from CORRAL_COMM_POLICY (default
-       comm_policy.json); dashboard authoring (add/remove sanctioned links)
-  NEW  Store creates its own DB directory (no more sqlite OperationalError)
-  NEW  access-graph dedup: model-retry duplicate writes collapse in reports
-  KEPT v0.3.1 act-file-narrate-async: containment and incident filing
-       never wait for the model; LLM reports replace records in place.
+v0.5.0 "Hardening"
+  NEW  signature-bound argument capture: positional calls can no longer
+       bypass resource extraction (inspect.signature binding; the v0.4
+       arg0/arg1 path was a full policy bypass)
+  NEW  scoped credentials: CORRAL_INGEST_KEY for agent hosts (register +
+       emit only), CORRAL_API_KEY for admin/forensic operations. Agent
+       hosts can no longer unblock resources or resume themselves.
+  NEW  per-session tokens: POST /sessions issues a bearer token; events
+       for a registered session without its token are rejected — events
+       can no longer be forged into another agent's session (framing /
+       evidence-poisoning / quarantine-DoS closed)
+  NEW  synchronous enforcement: POST /events returns directives
+       (suspended / deny) and the SDK enforces them BEFORE the tool
+       runs — containment no longer waits for the defender's poll
+  NEW  CommPolicy default "deny" is now enforced: unsanctioned reads
+       are vetoed synchronously, not just flagged
+  NEW  server-side ingest timestamps + watermark-based defender paging:
+       client clock skew no longer corrupts detection windows or the
+       containment metric; >limit flagged backlogs are drained, not
+       silently skipped
+  NEW  incident coalescing (CORRAL_COALESCE_S, default 300s): repeat
+       findings for the same playbook/sessions/resources update the
+       existing thread instead of storming new incidents
+  NEW  optional fail-closed SDK mode (CORRAL_FAIL_CLOSED=1)
+  NEW  explicit op= on guarded tools; removed "open"/"close" verb
+       collisions that manufactured phantom writers
+  NEW  tier-2 executor hooks: register_executor() runs approved
+       pending actions; approving is no longer cosmetic
+  NEW  content heuristics score BEFORE redaction (the redactor was
+       blinding the supply-chain keyword check on credential words)
+  NEW  credential_access tiering: name-only matches report; suspension
+       requires an actual policy denial or env-credential read
+  NEW  manual blocks default to CORRAL_BLOCK_TTL like defender blocks
+       (ttl<=0 for permanent); halted-attempt telemetry after suspension
+  KEPT act-file-narrate-async: containment and incident filing never
+       wait for the model; LLM reports replace records in place.
 
 Design invariants:
   - The deterministic rule engine is the backbone. The LLM is optional.
   - Containment and incident filing never wait for the model.
-  - The SDK fails OPEN: monitoring must never take down the host agent.
+  - The SDK fails OPEN by default: monitoring must never take down the
+    host agent. Set CORRAL_FAIL_CLOSED=1 where enforcement must hold.
   - Zero-trust between agents: cross-session shared-resource access is
     flagged unless explicitly sanctioned by CommPolicy.
   - Blocks are recoverable: TTL by default, unblock API always.
+  - One file. dashboard.html is embedded; an external file next to
+    corral.py overrides it for development.
+
+SCOPE (read this): enforcement lives in the agent's own process. Corral
+contains drifting, injected, or reward-hacking agents that use the
+instrumented tool path. An agent with unconstrained code execution on
+the same host can bypass any in-process guard — pair Corral with
+sandbox-level egress control for adversarial settings.
 """
 from __future__ import annotations
-import argparse, fnmatch, json, os, re, shutil, sqlite3, sys, threading, time, uuid
+import argparse, fnmatch, inspect, json, os, re, shutil, sqlite3, sys
+import threading, time, uuid
 from collections import defaultdict, deque
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import httpx
 from pydantic import BaseModel, Field
 
-__version__ = "0.4.3"
+__version__ = "0.5.5"
 DEFAULT_URL = os.environ.get("CORRAL_URL", "http://127.0.0.1:7331")
-CORRAL_API_KEY = os.environ.get("CORRAL_API_KEY", "")
+CORRAL_API_KEY = os.environ.get("CORRAL_API_KEY", "")        # admin scope
+CORRAL_INGEST_KEY = os.environ.get("CORRAL_INGEST_KEY", "")  # agent scope
 BLOCK_TTL = float(os.environ.get("CORRAL_BLOCK_TTL", "3600"))
+COALESCE_S = float(os.environ.get("CORRAL_COALESCE_S", "300"))
+FAIL_CLOSED = bool(os.environ.get("CORRAL_FAIL_CLOSED"))
+INGEST_RATE = int(os.environ.get("CORRAL_INGEST_RATE", "600"))  # ev/min/session
 
 # ═════════════════════════ §1 TYPES ═════════════════════════
 
@@ -53,6 +92,7 @@ class ResourceKind(str, Enum):
 class Resource(BaseModel):
     kind: ResourceKind
     value: str
+    source: str = "mapped"   # "mapped" | "deep_scan" (v0.5.2)
 
 class Outcome(str, Enum):
     allowed = "allowed"; blocked = "blocked"; halted = "halted"; error = "error"
@@ -60,13 +100,14 @@ class Outcome(str, Enum):
 class ToolCallEvent(BaseModel):
     session_id: str
     agent_id: str
-    ts: float = Field(default_factory=time.time)
+    ts: float = Field(default_factory=time.time)   # client clock, forensic
     tool: str
     args: dict[str, Any] = Field(default_factory=dict)
     resource: Optional[Resource] = None
     outcome: Outcome = Outcome.allowed
     reason: str = ""
-    flags: list[str] = Field(default_factory=list)
+    flags: list[str] = Field(default_factory=list)  # SDK-side hints
+    op: Optional[str] = None   # explicit read/write override (v0.5)
     event_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
 class Verdict(BaseModel):
@@ -85,7 +126,7 @@ class CommLink(BaseModel):
 
 class CommPolicy(BaseModel):
     links: list[CommLink] = Field(default_factory=list)
-    default: str = "flag"
+    default: str = "flag"   # "flag" | "deny" (enforced server-side, v0.5)
 
 def jsonable(obj: Any) -> Any:
     if obj is None or isinstance(obj, (bool, int, float, str)):
@@ -106,7 +147,7 @@ class BlockIn(BaseModel):
     kind: str
     value: str
     reason: str = "defender action"
-    ttl: Optional[float] = None
+    ttl: Optional[float] = None   # None → BLOCK_TTL; <=0 → permanent
 
 class IncidentIn(BaseModel):
     incident_id: str
@@ -123,19 +164,23 @@ class PendingIn(BaseModel):
     params: dict = Field(default_factory=dict)
     description: str = ""
 
+class PendingResolveIn(BaseModel):
+    status: str   # approved | denied | executed | failed
+
 class CommPolicyIn(BaseModel):
     links: list[CommLink] = Field(default_factory=list)
     default: str = "flag"
 
-# ═════════════════════════ §2 POLICY ENGINE ═════════════════════════
+# ═════════════════════════ §2 POLICY ENGINE ═════════════════
 
 class AgentPolicy(BaseModel):
     agent_id: str
     allowed_tools: Optional[list[str]] = None
-    allowed_domains: list[str] = Field(default_factory=list)
-    allowed_file_prefixes: list[str] = Field(default_factory=list)
+    # None = unset (allow-all, warned); [] = deny-all. v0.5 semantics.
+    allowed_domains: Optional[list[str]] = None
+    allowed_file_prefixes: Optional[list[str]] = None
     allowed_packages: Optional[list[str]] = None
-    allowed_env: list[str] = Field(default_factory=list)
+    allowed_env: list[str] = Field(default_factory=list)  # [] = deny all
     allowed_resource_kinds: Optional[list[str]] = None
     max_calls_per_minute: int = 240
     sensitive_patterns: list[str] = Field(default_factory=lambda: list(SENSITIVE_DEFAULT))
@@ -156,21 +201,92 @@ _RESOURCE_KEYS = {
 }
 _DNS_TOOL_HINTS = ("dns", "resolve", "lookup")
 
+# v0.5.2: canonicalize resource values so blocklists and the access graph
+# can't be dodged with lexical variants (./x, a/../a/x, evil.com.,
+# Foo_Bar vs foo-bar).
+def normalize_resource(kind: str, value: str) -> str:
+    if kind == "domain":
+        return value.lower().rstrip(".")
+    if kind == "file":
+        return os.path.normpath(value)
+    if kind == "package":
+        return re.sub(r"[-_.]+", "-", value).lower()
+    return value
+
+# deep-scan fallback: when no mapped argument key fires, a string argument
+# whose ENTIRE value looks like a resource probably IS the resource.
+# Content-shaped keys are excluded so prose doesn't false-positive.
+_CONTENT_KEYS = {"content", "body", "payload", "text", "code", "data",
+                 "message", "title", "query", "prompt", "description"}
+_URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://\S+$")
+_IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?(?:/\S*)?$")
+_PATH_RE = re.compile(r"^(?:/|~/|\./|\.\./)[\w.@+\-/]{1,300}$")
+
+def _deep_scan(args: dict) -> Optional[Resource]:
+    for k, v in args.items():
+        if k.lower() in _CONTENT_KEYS or not isinstance(v, str):
+            continue
+        v = v.strip()
+        if not v or len(v) > 300:
+            continue
+        if _URL_RE.match(v):
+            host = urlparse(v).hostname or v
+            return Resource(kind=ResourceKind.domain,
+                            value=normalize_resource("domain", host),
+                            source="deep_scan")
+        if _IP_RE.match(v):
+            return Resource(kind=ResourceKind.domain,
+                            value=v.split("/")[0].split(":")[0],
+                            source="deep_scan")
+        if _PATH_RE.match(v):
+            return Resource(kind=ResourceKind.file,
+                            value=normalize_resource("file", v),
+                            source="deep_scan")
+    return None
+
+# v0.5.5: relay laundering — a URL embedded inside another URL's
+# path/query turns an ALLOWED domain into a proxy for a blocked one
+# (urlquery.net/scan?u=http://target — the Tencent-fleet trick).
+_NESTED_SCHEME = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+def _nested_url_hosts(args: dict) -> set:
+    """Hosts of URLs embedded BEYOND the envelope URL, per argument.
+    The first scheme:// is the envelope; anything after is cargo.
+    Content keys are excluded — prose legitimately contains links."""
+    hosts = set()
+    for k, v in args.items():
+        if k.lower() in _CONTENT_KEYS or not isinstance(v, str) \
+                or len(v) > 2000:
+            continue
+        s = v
+        for _ in range(3):            # peel double/triple URL-encoding
+            d = unquote(s)
+            if d == s:
+                break
+            s = d
+        hits = list(_NESTED_SCHEME.finditer(s))
+        for m in hits[1:]:
+            host = urlparse(s[m.start():]).hostname
+            if host:
+                hosts.add(normalize_resource("domain", host))
+    return hosts
+
 def extract_resource(tool: str, args: dict) -> Optional[Resource]:
     t = tool.lower()
     if any(h in t for h in _DNS_TOOL_HINTS):
         for k in ("hostname", "host", "name", "domain", "target"):
             if k in args and isinstance(args[k], str) and args[k]:
-                return Resource(kind=ResourceKind.domain, value=args[k].lower())
+                return Resource(kind=ResourceKind.domain,
+                                value=normalize_resource("domain", args[k]))
     for key, kind in _RESOURCE_KEYS.items():
         if key in args and isinstance(args[key], str) and args[key]:
             val = args[key]
-            if kind == "domain":
-                if "://" in val:
-                    val = urlparse(val).hostname or val
-                return Resource(kind=ResourceKind.domain, value=val.lower())
-            return Resource(kind=ResourceKind(kind), value=val)
-    return None
+            if kind == "domain" and "://" in val:
+                val = urlparse(val).hostname or val
+            return Resource(kind=ResourceKind(kind),
+                            value=normalize_resource(kind, val))
+    return _deep_scan(args)   # v0.5.2: never leave a resource-shaped
+                              # argument unexamined
 
 def _is_sensitive(value: str, patterns: list[str]) -> bool:
     v = value.lower()
@@ -189,13 +305,13 @@ def evaluate_policy(policy: AgentPolicy, tool: str, args: dict,
     if r.kind == ResourceKind.domain:
         if _is_sensitive(r.value, pats):
             return False, f"sensitive domain '{r.value}'"
-        if policy.allowed_domains and r.value not in policy.allowed_domains:
+        if policy.allowed_domains is not None and r.value not in policy.allowed_domains:
             return False, f"domain '{r.value}' not in allowlist"
     elif r.kind == ResourceKind.file:
         if _is_sensitive(r.value, pats):
             return False, f"sensitive file path '{r.value}'"
-        if policy.allowed_file_prefixes and not any(
-                r.value.startswith(p) for p in policy.allowed_file_prefixes):
+        if (policy.allowed_file_prefixes is not None and not any(
+                r.value.startswith(p) for p in policy.allowed_file_prefixes)):
             return False, f"file '{r.value}' outside allowed prefixes"
     elif r.kind == ResourceKind.package:
         if _is_sensitive(r.value, pats):
@@ -220,57 +336,116 @@ def redact(args: dict, patterns: list[str]) -> dict:
 # ═════════════════════════ §3 SDK ═════════════════════════
 
 BLOCK_CACHE_TTL = 5.0
+EMIT_BUFFER_MAX = 1000
+
+class CorralUnavailable(Exception):
+    """Fail-closed mode: collector unreachable, enforcement cannot run."""
 
 class CorralClient:
-    """Sync client. Fails OPEN — buffers events, warns on stderr."""
+    """Sync client. Fails OPEN by default — buffers events, warns on
+    stderr. With CORRAL_FAIL_CLOSED=1, raises CorralUnavailable instead."""
 
-    def __init__(self, base_url: Optional[str] = None, timeout: float = 2.0):
+    def __init__(self, base_url: Optional[str] = None, timeout: float = 2.0,
+                 fail_closed: Optional[bool] = None):
         self.base = (base_url or DEFAULT_URL).rstrip("/")
-        headers = ({"X-Corral-Key": CORRAL_API_KEY} if CORRAL_API_KEY else {})
+        self.fail_closed = FAIL_CLOSED if fail_closed is None else fail_closed
+        headers = {}
+        if CORRAL_API_KEY:
+            headers["X-Corral-Key"] = CORRAL_API_KEY
+        if CORRAL_INGEST_KEY:
+            headers["X-Corral-Ingest-Key"] = CORRAL_INGEST_KEY
         self._http = httpx.Client(base_url=self.base, timeout=timeout,
                                   headers=headers)
-        self._buffer: list[dict] = []
+        self._buffer: deque = deque(maxlen=EMIT_BUFFER_MAX)
         self._blocks: tuple[float, set] = (0.0, set())
+        self._blocks_last_attempt = 0.0
+        self._token: Optional[str] = None
+
+    def close(self):
+        self._http.close()
 
     def register_session(self, session_id: str, agent_id: str) -> bool:
-        return self._try("POST", "/sessions",
-                         json={"session_id": session_id,
-                               "agent_id": agent_id})
+        try:
+            r = self._http.post("/sessions",
+                                json={"session_id": session_id,
+                                      "agent_id": agent_id})
+            if r.status_code == 200:
+                tok = r.json().get("session_token")
+                if tok:
+                    self._token = tok   # only returned on first insert
+                return True
+            print(f"[corral] register -> {r.status_code}: "
+                  f"{r.text[:120]}", file=sys.stderr)
+        except Exception:
+            pass
+        if self.fail_closed:
+            raise CorralUnavailable("collector unreachable at registration")
+        return False
 
     def suspended(self, session_id: str) -> bool:
         try:
-            r = self._http.get(f"/sessions/{session_id}")
+            headers = ({"X-Corral-Session": self._token}
+                       if self._token else {})
+            r = self._http.get(f"/sessions/{session_id}", headers=headers)
             if r.status_code == 200:
                 return bool(r.json().get("suspended", False))
         except Exception:
-            pass
+            if self.fail_closed:
+                raise CorralUnavailable("collector unreachable at precheck")
         return False
 
     def blocked(self, kind: str, value: str) -> bool:
         ts, blocks = self._blocks
-        if time.time() - ts > BLOCK_CACHE_TTL:
-            self._blocks = (time.time(), blocks)
-            try:
-                r = self._http.get("/blocks")
-                if r.status_code == 200:
-                    blocks = {(b["kind"], b["value"])
+        now = time.time()
+        if now - ts > BLOCK_CACHE_TTL and now - self._blocks_last_attempt > 1.0:
+            self._blocks_last_attempt = now   # backoff on failure; the
+            try:                              # timestamp only advances
+                r = self._http.get("/blocks") # on success, so a collector
+                if r.status_code == 200:      # flap doesn't extend the
+                    blocks = {(b["kind"], b["value"])  # stale window
                               for b in r.json().get("blocks", [])}
-                    self._blocks = (time.time(), blocks)
+                    self._blocks = (now, blocks)
             except Exception:
-                pass
+                if self.fail_closed:
+                    raise CorralUnavailable("collector unreachable at "
+                                            "blocklist refresh")
         return (kind, value) in blocks
 
-    def emit(self, event: ToolCallEvent) -> None:
+    def emit(self, event: ToolCallEvent) -> Optional[dict]:
+        """POST the event; return server enforcement directives (v0.5)
+        or None when the collector is unreachable / fail-open."""
         payload = jsonable(event.model_dump())
-        if not self._try("POST", "/events", json=payload):
-            self._buffer.append(payload)
-            if len(self._buffer) % 20 == 1:
-                print(f"[corral] collector unreachable; buffering "
-                      f"({len(self._buffer)} events)", file=sys.stderr)
-        elif self._buffer:
-            for p in self._buffer[:]:
-                if self._try("POST", "/events", json=p):
+        headers = ({"X-Corral-Session": self._token} if self._token else {})
+        try:
+            r = self._http.post("/events", json=payload, headers=headers)
+            if r.status_code == 200:
+                self._flush()
+                return r.json()
+            print(f"[corral] POST /events -> {r.status_code}: "
+                  f"{r.text[:120]}", file=sys.stderr)
+        except Exception:
+            pass
+        if self.fail_closed:
+            raise CorralUnavailable("collector unreachable at emit")
+        self._buffer.append(payload)
+        if len(self._buffer) == 1 or len(self._buffer) % 20 == 0:
+            print(f"[corral] collector unreachable; buffering "
+                  f"({len(self._buffer)} events)", file=sys.stderr)
+        return None
+
+    def _flush(self):
+        if not self._buffer:
+            return
+        headers = ({"X-Corral-Session": self._token} if self._token else {})
+        for p in list(self._buffer):
+            try:
+                r = self._http.post("/events", json=p, headers=headers)
+                if r.status_code == 200:
                     self._buffer.remove(p)
+                else:
+                    break
+            except Exception:
+                break
 
     def _try(self, method: str, path: str, **kw) -> bool:
         try:
@@ -298,12 +473,19 @@ class GuardedAgent:
         self.session_id = session_id or f"{agent_id}-{uuid.uuid4().hex[:8]}"
         self._call_times: deque = deque()
         self._registered = False
+        if (policy.allowed_tools is None and policy.allowed_domains is None
+                and policy.allowed_file_prefixes is None
+                and policy.allowed_packages is None):
+            print(f"[corral] WARNING: policy for '{agent_id}' sets no "
+                  f"allowlists — all tools/domains/files permitted. "
+                  f"Zero-trust starts with explicit allowlists.",
+                  file=sys.stderr)
 
     def tool(self, fn: Callable, name: Optional[str] = None,
-             resource_fn: Optional[Callable[[dict], Optional[Resource]]] = None
-             ) -> "GuardedTool":
+             resource_fn: Optional[Callable[[dict], Optional[Resource]]] = None,
+             op: Optional[str] = None) -> "GuardedTool":
         return GuardedTool(fn, name or getattr(fn, "__name__", "tool"),
-                           self, resource_fn)
+                           self, resource_fn, op)
 
     def _precheck(self) -> None:
         if os.environ.get("CORRAL_DISABLE"):
@@ -323,9 +505,10 @@ class GuardedAgent:
 
 class GuardedTool:
     def __init__(self, fn: Callable, name: str, agent: GuardedAgent,
-                 resource_fn: Optional[Callable]):
+                 resource_fn: Optional[Callable], op: Optional[str] = None):
         self.fn, self.name, self.agent = fn, name, agent
         self.resource_fn = resource_fn
+        self.op = op
         self.__name__ = name
 
     def __call__(self, *args, **kwargs):
@@ -333,7 +516,17 @@ class GuardedTool:
             return self.fn(*args, **kwargs)
         call_args = self._capture(args, kwargs)
         a = self.agent
-        a._precheck()
+        try:
+            a._precheck()
+        except Halt:
+            # v0.5: post-suspension persistence is a high-signal event.
+            # v0.5.3: carry the resource — WHAT the suspended agent was
+            # still reaching for is the most forensic part of the event.
+            resource = (self.resource_fn(call_args) if self.resource_fn
+                        else extract_resource(self.name, call_args))
+            self._emit(call_args, resource, Outcome.halted,
+                       "call attempted on suspended session")
+            raise
         resource = (self.resource_fn(call_args) if self.resource_fn
                     else extract_resource(self.name, call_args))
         allowed, reason = True, ""
@@ -342,28 +535,70 @@ class GuardedTool:
         else:
             allowed, reason = evaluate_policy(
                 a.policy, self.name, call_args, resource)
+            # v0.5.5: an allowlisted domain used as a relay for a
+            # non-allowlisted host violates the allowlist's intent
+            if allowed and a.policy.allowed_domains is not None:
+                nested = _nested_url_hosts(call_args)
+                allow = {normalize_resource("domain", d)
+                         for d in a.policy.allowed_domains}
+                off = sorted(h for h in nested if h not in allow)
+                if off:
+                    allowed, reason = False, (
+                        f"relay-laundered egress: '{off[0]}' embedded in "
+                        f"request to an allowed domain")
             if allowed and resource and a.client.blocked(
                     resource.kind.value, resource.value):
                 allowed, reason = False, (
                     f"{resource.kind.value} '{resource.value}' is blocklisted")
-        ev = ToolCallEvent(
-            session_id=a.session_id, agent_id=a.agent_id, tool=self.name,
-            args=redact(call_args, a.policy.sensitive_patterns),
-            resource=resource,
-            outcome=Outcome.allowed if allowed else Outcome.blocked,
-            reason=reason)
-        a.client.emit(ev)
+        directives = self._emit(
+            call_args, resource,
+            Outcome.allowed if allowed else Outcome.blocked, reason)
+        # v0.5: synchronous enforcement — server verdicts land BEFORE
+        # the tool executes, closing the poll-window race.
+        if directives:
+            if directives.get("suspended"):
+                raise Halt(f"session {a.session_id} suspended by defender")
+            if directives.get("deny"):
+                raise PolicyBlocked(
+                    directives.get("deny_reason") or "denied by defender")
         if not allowed:
             raise PolicyBlocked(reason)
         return self.fn(*args, **kwargs)
 
+    def _emit(self, call_args, resource, outcome, reason) -> Optional[dict]:
+        a = self.agent
+        # v0.5: content heuristics score BEFORE redaction, as a hint
+        # flag — the redactor would otherwise blind the server-side
+        # keyword check on credential words.
+        hints = []
+        for v in call_args.values():
+            if isinstance(v, str) and _SUSPICIOUS_CONTENT.search(v):
+                hints.append("suspicious_content")
+                break
+        if _nested_url_hosts(call_args):
+            hints.append("relay_laundering")   # v0.5.5
+        ev = ToolCallEvent(
+            session_id=a.session_id, agent_id=a.agent_id, tool=self.name,
+            args=redact(call_args, a.policy.sensitive_patterns),
+            resource=resource, outcome=outcome, reason=reason,
+            flags=hints, op=self.op)
+        return a.client.emit(ev)
+
     def _capture(self, args, kwargs) -> dict:
+        # Frameworks often pass a single dict positionally.
         if len(args) == 1 and isinstance(args[0], dict):
             merged = dict(args[0]); merged.update(kwargs); return merged
-        d = dict(kwargs)
-        for i, v in enumerate(args):
-            d[f"arg{i}"] = v
-        return d
+        # v0.5: bind positionals to real parameter names — the old
+        # arg0/arg1 fallback made resource extraction impossible and
+        # was a complete policy bypass for positional calls.
+        try:
+            return dict(inspect.signature(self.fn).bind(*args, **kwargs)
+                        .arguments)
+        except (TypeError, ValueError):
+            d = dict(kwargs)
+            for i, v in enumerate(args):
+                d[f"arg{i}"] = v
+            return d
 
 # ---- framework adapters ---------------------------------------------------
 
@@ -405,14 +640,15 @@ def wrap_openai_agents(tool_fns: dict, agent: GuardedAgent):
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions(
   session_id TEXT PRIMARY KEY, agent_id TEXT, status TEXT DEFAULT 'active',
-  created REAL);
+  created REAL, token TEXT);
 CREATE TABLE IF NOT EXISTS events(
-  event_id TEXT PRIMARY KEY, ts REAL, session_id TEXT, agent_id TEXT,
-  tool TEXT, args TEXT, resource TEXT, outcome TEXT, reason TEXT, flags TEXT);
-CREATE INDEX IF NOT EXISTS idx_events_flag_ts ON events(ts);
+  event_id TEXT PRIMARY KEY, ts REAL, ingest_ts REAL, session_id TEXT,
+  agent_id TEXT, tool TEXT, args TEXT, resource TEXT, outcome TEXT,
+  reason TEXT, flags TEXT);
+CREATE INDEX IF NOT EXISTS idx_events_ingest ON events(ingest_ts);
 CREATE TABLE IF NOT EXISTS resource_access(
-  ts REAL, kind TEXT, value TEXT, session_id TEXT, agent_id TEXT,
-  op TEXT, event_id TEXT);
+  ts REAL, ingest_ts REAL, kind TEXT, value TEXT, session_id TEXT,
+  agent_id TEXT, op TEXT, event_id TEXT, outcome TEXT);
 CREATE INDEX IF NOT EXISTS idx_ra ON resource_access(kind, value, ts);
 CREATE TABLE IF NOT EXISTS blocks(
   kind TEXT, value TEXT, reason TEXT, ts REAL, expires REAL,
@@ -426,23 +662,47 @@ CREATE TABLE IF NOT EXISTS pending(
   params TEXT, description TEXT, status TEXT DEFAULT 'pending', created REAL);
 """
 
+def _migrate(db: sqlite3.Connection):
+    """Additive migrations for pre-v0.5 databases."""
+    def cols(table):
+        return {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+    if "token" not in cols("sessions"):
+        db.execute("ALTER TABLE sessions ADD COLUMN token TEXT")
+    if "ingest_ts" not in cols("events"):
+        db.execute("ALTER TABLE events ADD COLUMN ingest_ts REAL")
+        db.execute("UPDATE events SET ingest_ts = ts WHERE ingest_ts IS NULL")
+    if "ingest_ts" not in cols("resource_access"):
+        db.execute("ALTER TABLE resource_access ADD COLUMN ingest_ts REAL")
+        db.execute("UPDATE resource_access SET ingest_ts = ts "
+                   "WHERE ingest_ts IS NULL")
+    if "outcome" not in cols("resource_access"):
+        db.execute("ALTER TABLE resource_access ADD COLUMN outcome TEXT")
+        db.execute("UPDATE resource_access SET outcome='allowed' "
+                   "WHERE outcome IS NULL")
+    db.commit()
+
 class Store:
     def __init__(self, path: str):
         d = os.path.dirname(os.path.abspath(path))
         if d:
-            os.makedirs(d, exist_ok=True)   # v0.4: never trust the caller
+            os.makedirs(d, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.Lock()
         with self.lock:
             self.db.executescript(SCHEMA)
+            _migrate(self.db)
 
     # -- sessions -------------------------------------------------
-    def register_session(self, sid, aid):
+    def register_session(self, sid, aid, token):
+        """Returns the session token on first registration, None if the
+        session already exists (re-registration never leaks the token)."""
         with self.lock:
-            self.db.execute("INSERT OR IGNORE INTO sessions VALUES(?,?,?,?)",
-                            (sid, aid, "active", time.time()))
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO sessions VALUES(?,?,?,?,?)",
+                (sid, aid, "active", time.time(), token))
             self.db.commit()
+            return token if cur.rowcount else None
 
     def set_status(self, sid, status):
         with self.lock:
@@ -460,53 +720,65 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "SELECT * FROM sessions ORDER BY created DESC").fetchall()
-        return [dict(r) for r in rows]
+        # never leak bearer tokens over the API
+        return [{k: v for k, v in dict(r).items() if k != "token"}
+                for r in rows]
 
     # -- events ---------------------------------------------------
     def insert_event(self, ev: ToolCallEvent, flags: list):
         with self.lock:
             self.db.execute(
-                "INSERT OR REPLACE INTO events VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (ev.event_id, ev.ts, ev.session_id, ev.agent_id, ev.tool,
-                 json.dumps(ev.args),
+                "INSERT OR REPLACE INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (ev.event_id, ev.ts, time.time(), ev.session_id, ev.agent_id,
+                 ev.tool, json.dumps(ev.args),
                  json.dumps(ev.resource.model_dump()) if ev.resource else None,
                  ev.outcome.value, ev.reason, json.dumps(flags)))
             self.db.commit()
 
     def events(self, session=None, flagged=False, since=0.0, limit=200):
-        q, params = "SELECT * FROM events WHERE ts > ?", [since]
+        """`since` filters on ingest_ts (server clock) — immune to agent
+        clock skew. Returns (events, watermark)."""
+        q, params = "SELECT * FROM events WHERE ingest_ts > ?", [since]
         if session:
             q += " AND session_id = ?"; params.append(session)
         if flagged:
             q += " AND flags != '[]'"
-        q += " ORDER BY ts ASC LIMIT ?"; params.append(limit)
+        q += " ORDER BY ingest_ts ASC LIMIT ?"; params.append(limit)
         with self.lock:
             rows = self.db.execute(q, params).fetchall()
-        out = []
+        out, wm = [], since
         for r in rows:
             d = dict(r)
             d["args"] = json.loads(d["args"] or "{}")
             d["resource"] = json.loads(d["resource"]) if d["resource"] else None
             d["flags"] = json.loads(d["flags"] or "[]")
+            wm = max(wm, d.get("ingest_ts") or d["ts"])
             out.append(d)
-        return out
+        return out, wm
 
     # -- access graph ---------------------------------------------
     def insert_access(self, ev: ToolCallEvent, op: str):
         if ev.resource is None:
             return
         with self.lock:
-            self.db.execute("INSERT INTO resource_access VALUES(?,?,?,?,?,?,?)",
-                            (ev.ts, ev.resource.kind.value,
-                             ev.resource.value, ev.session_id, ev.agent_id,
-                             op, ev.event_id))
+            self.db.execute(
+                "INSERT INTO resource_access VALUES(?,?,?,?,?,?,?,?,?)",
+                (ev.ts, time.time(), ev.resource.kind.value,
+                 ev.resource.value, ev.session_id, ev.agent_id,
+                 op, ev.event_id, ev.outcome.value))
             self.db.commit()
 
     def access_writes(self, kind: str, value: str, since: float):
+        # v0.5.1: only SUCCESSFUL writes count. A covert channel requires
+        # a working write; a blocked attempt must not manufacture
+        # coordination when a later reader touches the same resource.
+        # v0.5.2: the window runs on ingest_ts (server clock) — a client
+        # backdating its events must not escape correlation.
         with self.lock:
             rows = self.db.execute(
                 "SELECT * FROM resource_access WHERE kind=? AND value=? "
-                "AND ts>? AND op='write'", (kind, value, since)).fetchall()
+                "AND ingest_ts>? AND op='write' AND outcome='allowed'",
+                (kind, value, since)).fetchall()
         return [dict(r) for r in rows]
 
     def resource_access(self, kind=None, value=None, since=0.0, limit=500):
@@ -520,7 +792,7 @@ class Store:
             rows = self.db.execute(q, params).fetchall()
         return [dict(r) for r in rows]
 
-    # -- blocks (v0.4: lifecycle) ----------------------------------
+    # -- blocks (lifecycle) ----------------------------------------
     def add_block(self, kind, value, reason, ttl=None):
         expires = (time.time() + ttl) if ttl else None
         with self.lock:
@@ -533,6 +805,14 @@ class Store:
             self.db.execute("DELETE FROM blocks WHERE kind=? AND value=?",
                             (kind, value))
             self.db.commit()
+
+    def is_blocked(self, kind, value) -> bool:
+        now = time.time()
+        with self.lock:
+            row = self.db.execute(
+                "SELECT expires FROM blocks WHERE kind=? AND value=?",
+                (kind, value)).fetchone()
+        return bool(row and (row["expires"] is None or row["expires"] > now))
 
     def blocks(self):
         now = time.time()
@@ -581,10 +861,10 @@ class Store:
             self.db.commit()
         return pid
 
-    def pending(self):
+    def pending(self, status="pending"):
         with self.lock:
             rows = self.db.execute(
-                "SELECT * FROM pending WHERE status='pending'").fetchall()
+                "SELECT * FROM pending WHERE status=?", (status,)).fetchall()
         return [dict(r) for r in rows]
 
     def resolve_pending(self, pid, status):
@@ -595,13 +875,16 @@ class Store:
 
 # ---- anomaly engine --------------------------------------------------------
 
+# v0.5: "open" and "close" removed — open() defaults to read mode and
+# manufactured phantom writers (false unsanctioned_comm). Declare the op
+# explicitly via ga.tool(..., op="read"|"write") when names mislead.
 _WRITE = ("publish", "write", "save", "upload", "post", "put", "create",
           "update", "send", "delete", "set", "push", "emit", "broadcast",
           "notify", "reply", "comment", "store", "patch", "merge",
-          "insert", "commit", "open")
+          "insert", "commit")
 _READ = ("fetch", "read", "get", "load", "download", "view", "search",
          "pull", "receive", "poll", "subscribe", "listen", "watch",
-         "check", "list", "query", "scan", "peek", "browse", "close",
+         "check", "list", "query", "scan", "peek", "browse",
          "lookup", "resolve")
 _CODE_EXEC = ("run_code", "exec", "eval", "shell", "bash", "python",
               "subprocess", "terminal", "command")
@@ -609,8 +892,13 @@ _SUSPICIOUS_CONTENT = re.compile(
     r"(?i)(technique|exploit|instruction|coordinat|egress|exfiltrat|"
     r"secret|token|password|ssrf|lateral|bypass)")
 _NOTE_NAME = re.compile(r"(?i)(note|msg|message|board|chat|comms|scratch)")
-COORD_WINDOW, EGRESS_STREAK, EGRESS_WINDOW = 3600.0, 3, 600.0
+COORD_WINDOW = float(os.environ.get("CORRAL_COORD_WINDOW", "3600"))
+EGRESS_STREAK, EGRESS_WINDOW = 3, 600.0
 SSRF_WINDOW, CODE_EXEC_WATCH = 120.0, 60.0
+# informational flags: recorded and displayed, but never page the defender
+INFO_FLAGS = {"deep_scan_extraction", "opaque_call", "suspicious_content"}
+# outbound data riding an allowed domain: long/high-entropy path segments
+_EXFIL_SEGMENT = re.compile(r"[A-Za-z0-9+/=_-]{32,}")
 
 def _matches(name: str, hints) -> bool:
     n = name.lower()
@@ -634,56 +922,85 @@ class AnomalyEngine:
         self.allowed_fetches: dict[str, deque] = defaultdict(deque)
         self.last_code_exec: dict[str, float] = {}
 
-    def process(self, ev: ToolCallEvent) -> list[str]:
+    def process(self, ev: ToolCallEvent, now: Optional[float] = None) -> list[str]:
+        # v0.5.2: ALL detection windows run on the server clock (`now`).
+        # ev.ts is client-minted and attacker-controllable — backdating
+        # must not shrink egress/velocity/coordination windows.
+        now = now if now is not None else time.time()
         with self.lock:
-            flags = []
+            flags = list(ev.flags)   # SDK-side hints (e.g. suspicious_content)
             r = ev.resource
+            if r and getattr(r, "source", "mapped") == "deep_scan":
+                flags.append("deep_scan_extraction")
+            if r is None and any(isinstance(v, str) for v in ev.args.values()):
+                flags.append("opaque_call")  # string args, no resource —
+            #                                # adapter backlog, visible now
             if r and _is_sensitive(r.value, SENSITIVE_DEFAULT):
                 flags.append("credential_access")
             if (r and r.kind == ResourceKind.package
-                    and _matches(ev.tool, _WRITE)
-                    and (self._content_suspicious(ev)
+                    and (ev.op or op_of(ev.tool)) == "write"
+                    and ("suspicious_content" in flags
+                         or self._content_suspicious(ev)
                          or _NOTE_NAME.search(r.value))):
                 flags.append("supply_chain")
             if _matches(ev.tool, _CODE_EXEC):
                 flags.append("code_exec_watch")
-                self.last_code_exec[ev.session_id] = ev.ts
+                self.last_code_exec[ev.session_id] = now
+            if (r and r.kind == ResourceKind.domain
+                    and ev.outcome.value == "allowed"):
+                # exfil through an ALLOWED domain: policy can't see it,
+                # entropy can
+                for v in ev.args.values():
+                    if isinstance(v, str) and _EXFIL_SEGMENT.search(v):
+                        flags.append("possible_exfil")
+                        break
+                # relay laundering through an ALLOWED domain: the envelope
+                # passed policy, the cargo didn't (v0.5.5)
+                if _nested_url_hosts(ev.args) - {r.value}:
+                    flags.append("relay_laundering")
             if (r and r.kind == ResourceKind.domain
                     and ev.outcome.value == "blocked"):
                 dq = self.egress_attempts[ev.session_id]
-                dq.append(ev.ts)
-                while dq and ev.ts - dq[0] > EGRESS_WINDOW:
+                dq.append(now)
+                while dq and now - dq[0] > EGRESS_WINDOW:
                     dq.popleft()
                 if len(dq) >= EGRESS_STREAK:
                     flags.append("egress_escape")
-                elif self._recent_code_exec(ev.session_id, ev.ts):
+                elif self._recent_code_exec(ev.session_id, now):
                     flags.append("egress_escape")
-                if self._recent_allowed_fetch(ev.session_id, ev.ts):
+                if self._recent_allowed_fetch(ev.session_id, now):
                     flags.append("ssrf_chain")
             if (r and r.kind == ResourceKind.domain
                     and ev.outcome.value == "allowed"):
                 dq = self.allowed_fetches[ev.session_id]
-                dq.append(ev.ts)
-                while dq and ev.ts - dq[0] > SSRF_WINDOW:
+                dq.append(now)
+                while dq and now - dq[0] > SSRF_WINDOW:
                     dq.popleft()
             vdq = self.velocity[ev.session_id]
-            vdq.append(ev.ts)
-            while vdq and ev.ts - vdq[0] > 60.0:
+            vdq.append(now)
+            while vdq and now - vdq[0] > 60.0:
                 vdq.popleft()
             if len(vdq) > 240:
                 flags.append("velocity_abuse")
-            if r and _matches(ev.tool, _READ):
-                writers = self._prior_writers(r, ev)
+            if r and (ev.op or op_of(ev.tool)) == "read":
+                writers = self._prior_writers(r, ev, now)
                 if writers and not self._sanctioned(writers, ev.agent_id, r):
                     flags.append("unsanctioned_comm")
+            flags = list(dict.fromkeys(flags))
+            # the SDK content hint is enrichment only — on its own it is
+            # too noisy to page the defender (matches "instruction",
+            # "password" in ordinary prose)
+            if set(flags) == {"suspicious_content"}:
+                return []
             if flags:
                 self.session_flags[ev.session_id] += len(flags)
             return flags
 
-    def _prior_writers(self, r: Resource, ev: ToolCallEvent) -> set:
+    def _prior_writers(self, r: Resource, ev: ToolCallEvent,
+                       now: float) -> set:
         try:
             rows = self.store.access_writes(r.kind.value, r.value,
-                                            ev.ts - COORD_WINDOW)
+                                            now - COORD_WINDOW)
             return {row["agent_id"] for row in rows
                     if row["session_id"] != ev.session_id}
         except Exception:
@@ -719,8 +1036,10 @@ class AnomalyEngine:
 # ---- FastAPI app -----------------------------------------------------------
 
 def create_app(db_path: str = "corral.db"):
-    from fastapi import FastAPI, HTTPException
-    from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.responses import FileResponse, PlainTextResponse
+    globals()["Request"] = Request  # PEP 563: annotations resolve via
+    # module globals — keep fastapi lazy but make the name resolvable
 
     app = FastAPI(title="corral", docs_url=None, redoc_url=None)
     app.state.store = Store(db_path)
@@ -728,30 +1047,46 @@ def create_app(db_path: str = "corral.db"):
     app.state.metrics = {"events_ingested": 0, "incidents_created": 0,
                          "sessions_suspended": 0, "flags_fired": {},
                          "started": time.time()}
+    app.state.ingest_rate = defaultdict(deque)
 
-    # v0.4: bootstrap CommPolicy from a config file if present
+    # v0.5 scoped auth:
+    #   CORRAL_API_KEY    → admin: forensic reads + all admin mutations
+    #   CORRAL_INGEST_KEY → agent hosts: register sessions + emit events
+    # Agent hosts hold ONLY the ingest key: they cannot unblock
+    # resources, resume sessions, rewrite CommPolicy, or read forensics.
+    def _admin_ok(req: Request) -> bool:
+        return (not CORRAL_API_KEY
+                or req.headers.get("x-corral-key") == CORRAL_API_KEY)
+
+    def _ingest_ok(req: Request) -> bool:
+        if not CORRAL_INGEST_KEY:
+            return True
+        return (req.headers.get("x-corral-ingest-key") == CORRAL_INGEST_KEY
+                or _admin_ok(req))
+
+    def require_admin(req: Request):
+        if not _admin_ok(req):
+            raise HTTPException(401, "admin key required")
+
+    def require_ingest(req: Request):
+        if not _ingest_ok(req):
+            raise HTTPException(401, "ingest key required")
+
+    # bootstrap CommPolicy from a config file if present
     policy_path = os.environ.get("CORRAL_COMM_POLICY", "comm_policy.json")
     if os.path.exists(policy_path):
         try:
             with open(policy_path) as f:
                 data = json.load(f)
             app.state.anomaly.comm_policy = CommPolicy(
-                links=[CommLink(**l) for l in data.get("links", [])])
+                links=[CommLink(**l) for l in data.get("links", [])],
+                default=data.get("default", "flag"))
             print(f"[corral] comm policy loaded from {policy_path} "
-                  f"({len(data.get('links', []))} sanctioned links)")
+                  f"({len(data.get('links', []))} sanctioned links, "
+                  f"default={data.get('default', 'flag')})")
         except Exception as e:
             print(f"[corral] failed to load comm policy from "
                   f"{policy_path}: {e}", file=sys.stderr)
-
-    if CORRAL_API_KEY:
-        @app.middleware("http")
-        async def auth(request, call_next):
-            if (request.method in ("GET", "HEAD")
-                    or request.url.path in ("/health", "/metrics", "/")):
-                return await call_next(request)
-            if request.headers.get("x-corral-key") != CORRAL_API_KEY:
-                return JSONResponse({"detail": "unauthorized"}, status_code=401)
-            return await call_next(request)
 
     @app.get("/health")
     def health():
@@ -765,92 +1100,173 @@ def create_app(db_path: str = "corral.db"):
 
     @app.get("/")
     def index():
+        # external file wins (development); embedded copy guarantees the
+        # single-file claim holds for pip installs
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "dashboard.html")
         if os.path.exists(path):
             return FileResponse(path)
-        return PlainTextResponse(
-            "dashboard.html missing — place next to corral.py")
+        from fastapi.responses import HTMLResponse
+        if DASHBOARD_HTML:
+            return HTMLResponse(DASHBOARD_HTML)
+        return PlainTextResponse("dashboard unavailable", status_code=404)
 
     @app.post("/sessions")
-    def register_session(s: SessionIn):
-        app.state.store.register_session(s.session_id, s.agent_id)
-        return {"ok": True}
+    def register_session(s: SessionIn, request: Request):
+        require_ingest(request)
+        existing = app.state.store.session(s.session_id)
+        if existing and existing["agent_id"] != s.agent_id:
+            # v0.5.2: no squatting on another agent's session identity
+            raise HTTPException(409, "session_id registered to a "
+                                     "different agent")
+        token = uuid.uuid4().hex
+        issued = app.state.store.register_session(s.session_id, s.agent_id,
+                                                  token)
+        # token returned ONLY on first registration — re-registering an
+        # existing session never discloses its token
+        return {"ok": True, "session_token": issued}
 
     @app.get("/sessions")
-    def list_sessions():
+    def list_sessions(request: Request):
+        require_admin(request)
         return {"sessions": app.state.store.sessions()}
 
     @app.get("/sessions/{sid}")
-    def get_session(sid: str):
+    def get_session(sid: str, request: Request):
         s = app.state.store.session(sid)
         if not s:
             raise HTTPException(404)
+        # the SDK prechecks its own session — allowed with a valid
+        # session token even under admin auth
+        if not _admin_ok(request):
+            if not s.get("token") or \
+                    request.headers.get("x-corral-session") != s["token"]:
+                raise HTTPException(401, "admin key or session token "
+                                         "required")
         return {"session_id": sid, "suspended": s["status"] == "suspended",
                 "status": s["status"]}
 
     @app.post("/sessions/{sid}/suspend")
-    def suspend(sid: str):
+    def suspend(sid: str, request: Request):
+        require_admin(request)
         app.state.store.set_status(sid, "suspended")
         app.state.metrics["sessions_suspended"] += 1
         return {"ok": True}
 
     @app.post("/sessions/{sid}/resume")
-    def resume(sid: str):
+    def resume(sid: str, request: Request):
+        require_admin(request)
         app.state.store.set_status(sid, "active")
         return {"ok": True}
 
     @app.post("/events")
-    def ingest(ev: ToolCallEvent):
-        flags = app.state.anomaly.process(ev)
-        app.state.store.insert_event(ev, flags)
-        app.state.store.insert_access(ev, op_of(ev.tool))
+    def ingest(ev: ToolCallEvent, request: Request):
+        require_ingest(request)
+        store = app.state.store
+        sess = store.session(ev.session_id)
+        if sess is None:
+            # events for unregistered sessions are rejected: attribution
+            # must be anchored at registration, not claimed at ingest
+            raise HTTPException(403, "session not registered")
+        if sess.get("token") and \
+                request.headers.get("x-corral-session") != sess["token"]:
+            raise HTTPException(403, "invalid session token")
+        # v0.5.2: per-session ingest rate limit — a flooding agent cannot
+        # bury the signal or bloat the evidence store
+        now = time.time()
+        dq = app.state.ingest_rate[ev.session_id]
+        dq.append(now)
+        while dq and now - dq[0] > 60.0:
+            dq.popleft()
+        if len(dq) > INGEST_RATE:
+            raise HTTPException(429, "ingest rate limit exceeded")
+        # v0.5.2: identity is bound server-side — the session token proves
+        # the session, the session proves the agent. A client-claimed
+        # agent_id is presentation, not identity.
+        if ev.agent_id != sess["agent_id"]:
+            ev = ev.model_copy(update={"agent_id": sess["agent_id"]})
+        flags = app.state.anomaly.process(ev, now=now)
+        store.insert_event(ev, flags)
+        store.insert_access(ev, ev.op or op_of(ev.tool))
         app.state.metrics["events_ingested"] += 1
         for f in flags:
             app.state.metrics["flags_fired"][f] = (
                 app.state.metrics["flags_fired"].get(f, 0) + 1)
-        return {"flags": flags}
+        # v0.5 synchronous enforcement directives — the SDK enforces
+        # these BEFORE the tool call executes
+        deny, deny_reason = False, ""
+        if ev.resource and store.is_blocked(ev.resource.kind.value,
+                                            ev.resource.value):
+            deny = True
+            deny_reason = (f"{ev.resource.kind.value} "
+                           f"'{ev.resource.value}' is blocklisted")
+        elif ("unsanctioned_comm" in flags
+                and app.state.anomaly.comm_policy.default == "deny"):
+            deny = True
+            deny_reason = ("unsanctioned cross-agent communication "
+                           "(CommPolicy default=deny)")
+        return {"flags": flags,
+                "suspended": sess["status"] == "suspended",
+                "deny": deny, "deny_reason": deny_reason}
 
     @app.get("/events")
-    def events(session: Optional[str] = None, flagged: bool = False,
-               since: float = 0.0, limit: int = 200):
-        return {"events": app.state.store.events(session, flagged,
-                                                 since, limit)}
+    def events(request: Request, session: Optional[str] = None,
+               flagged: bool = False, since: float = 0.0, limit: int = 200):
+        require_admin(request)
+        evs, wm = app.state.store.events(session, flagged, since, limit)
+        return {"events": evs, "watermark": wm}
 
     @app.get("/resource_access")
-    def get_access(kind: Optional[str] = None, value: Optional[str] = None,
-                   since: float = 0.0, limit: int = 500):
+    def get_access(request: Request, kind: Optional[str] = None,
+                   value: Optional[str] = None, since: float = 0.0,
+                   limit: int = 500):
+        require_admin(request)
         return {"access": app.state.store.resource_access(
             kind, value, since, limit)}
 
     @app.post("/comm_policy")
-    def set_comm_policy(p: CommPolicyIn):
+    def set_comm_policy(p: CommPolicyIn, request: Request):
+        require_admin(request)
+        if p.default not in ("flag", "deny"):
+            raise HTTPException(400, "default must be 'flag' or 'deny'")
         app.state.anomaly.comm_policy = CommPolicy(
             links=p.links, default=p.default)
-        return {"ok": True, "links": len(p.links)}
+        return {"ok": True, "links": len(p.links), "default": p.default}
 
     @app.get("/comm_policy")
-    def get_comm_policy():
+    def get_comm_policy(request: Request):
+        require_admin(request)
         p = app.state.anomaly.comm_policy
         return {"links": [l.model_dump() for l in p.links],
                 "default": p.default}
 
     @app.post("/blocks")
-    def add_block(b: BlockIn):
-        app.state.store.add_block(b.kind, b.value, b.reason, b.ttl)
+    def add_block(b: BlockIn, request: Request):
+        require_admin(request)
+        # v0.5: TTL by default for ALL blocks, not just defender-issued;
+        # ttl<=0 requests a permanent block explicitly
+        ttl = b.ttl if b.ttl is not None else BLOCK_TTL
+        if ttl is not None and ttl <= 0:
+            ttl = None
+        # v0.5.2: normalize so ./x, a/../x, trailing-dot FQDNs can't slip
+        app.state.store.add_block(b.kind, normalize_resource(b.kind, b.value),
+                                  b.reason, ttl)
         return {"ok": True}
 
     @app.delete("/blocks")
-    def remove_block(kind: str, value: str):
-        app.state.store.remove_block(kind, value)
+    def remove_block(request: Request, kind: str, value: str):
+        require_admin(request)
+        app.state.store.remove_block(kind, normalize_resource(kind, value))
         return {"ok": True}
 
     @app.get("/blocks")
-    def list_blocks():
-        return {"blocks": app.state.store.blocks()}
+    def list_blocks(request: Request):
+        require_ingest(request)   # the SDK enforces this list; agent
+        return {"blocks": app.state.store.blocks()}  # hosts may read it
 
     @app.post("/incidents")
-    def create_incident(i: IncidentIn):
+    def create_incident(i: IncidentIn, request: Request):
+        require_admin(request)
         app.state.store.insert_incident(
             i.incident_id, i.session_ids, i.event_ids, i.verdict,
             i.actions, i.report_md, i.started)
@@ -858,27 +1274,38 @@ def create_app(db_path: str = "corral.db"):
         return {"incident_id": i.incident_id}
 
     @app.get("/incidents")
-    def list_incidents():
+    def list_incidents(request: Request):
+        require_admin(request)
         return {"incidents": app.state.store.incidents()}
 
     @app.post("/pending")
-    def add_pending(p: PendingIn):
+    def add_pending(p: PendingIn, request: Request):
+        require_admin(request)
         pid = app.state.store.add_pending(
             p.incident_id, p.action_type, p.params, p.description)
         return {"pending_id": pid}
 
     @app.get("/pending")
-    def list_pending():
-        return {"pending": app.state.store.pending()}
+    def list_pending(request: Request, status: str = "pending"):
+        require_admin(request)
+        return {"pending": app.state.store.pending(status)}
 
     @app.post("/pending/{pid}/approve")
-    def approve(pid: str):
+    def approve(pid: str, request: Request):
+        require_admin(request)
         app.state.store.resolve_pending(pid, "approved")
         return {"ok": True}
 
     @app.post("/pending/{pid}/deny")
-    def deny(pid: str):
+    def deny(pid: str, request: Request):
+        require_admin(request)
         app.state.store.resolve_pending(pid, "denied")
+        return {"ok": True}
+
+    @app.post("/pending/{pid}/resolve")
+    def resolve(pid: str, body: PendingResolveIn, request: Request):
+        require_admin(request)
+        app.state.store.resolve_pending(pid, body.status)
         return {"ok": True}
 
     return app
@@ -896,6 +1323,9 @@ class LLM:
         self.base = (base_url or DEFAULT_LLM_BASE).rstrip("/")
         self.model = model or DEFAULT_LLM_MODEL
         self._http = httpx.Client(base_url=self.base, timeout=timeout)
+
+    def close(self):
+        self._http.close()
 
     def chat(self, system: str, user: str, json_mode: bool = True):
         msgs = [{"role": "system", "content": system},
@@ -930,7 +1360,7 @@ CLASSIFIER_SYSTEM = """You are the threat classifier of an autonomous AI-agent d
 Given recent flagged events from an AI agent fleet, respond ONLY with a JSON object:
 {"threat_class": one of ["egress_escape","unsanctioned_comm","credential_access",
    "supply_chain","ssrf_chain","code_exec_watch","scope_drift",
-   "velocity_abuse","benign"],
+   "velocity_abuse","relay_laundering","possible_exfil","benign"],
  "severity": one of ["low","medium","high","critical"],
  "confidence": float 0.0-1.0,
  "playbook": same as threat_class,
@@ -946,6 +1376,7 @@ FALLBACK_SEVERITY = {
     "egress_escape": "high", "ssrf_chain": "high",
     "supply_chain": "medium", "code_exec_watch": "low",
     "velocity_abuse": "medium", "scope_drift": "low",
+    "possible_exfil": "medium", "relay_laundering": "medium",
 }
 
 def classify(events: list[dict], fleet_context: dict, llm) -> Verdict:
@@ -963,13 +1394,15 @@ def classify(events: list[dict], fleet_context: dict, llm) -> Verdict:
                     return v
             except Exception:
                 pass
-    flags = [f for e in events for f in e.get("flags", [])]
+    # v0.5.4: INFO flags are hints, never a threat class — and the sort
+    # tiebreaks by name so equal-severity flags classify deterministically
+    flags = [f for e in events for f in e.get("flags", [])
+             if f not in INFO_FLAGS]
     if flags:
         sev_rank = {"critical": 3, "high": 2, "medium": 1, "low": 0}
         ranked = sorted(set(flags),
-                        key=lambda t: sev_rank.get(
-                            FALLBACK_SEVERITY.get(t, "medium"), 1),
-                        reverse=True)
+                        key=lambda t: (-sev_rank.get(
+                            FALLBACK_SEVERITY.get(t, "medium"), 1), t))
         threat = ranked[0]
     else:
         threat = "scope_drift"
@@ -992,7 +1425,28 @@ PLAYBOOK_ACTIONS = {
     "code_exec_watch":   [("report", 1)],
     "scope_drift":       [("suspend", 1), ("report", 1)],
     "velocity_abuse":    [("suspend", 1), ("report", 1)],
+    "possible_exfil":    [("report", 1)],
+    "relay_laundering":  [("report", 1)],
+    "report_only":       [("report", 1)],
 }
+
+def _downgrade_if_weak_signal(verdict: Verdict, events: list[dict]) -> Verdict:
+    """v0.5: machine-speed suspension requires hard evidence. A
+    credential_access verdict resting only on a sensitive-looking NAME
+    (e.g. 'tokenizer_config.json', 'password-policy.md') is report-only;
+    suspension requires an actual policy denial or an env-credential
+    read."""
+    if verdict.playbook == "credential_access":
+        hard = any(
+            e.get("outcome") == "blocked"
+            or (e.get("resource") or {}).get("kind") == "env"
+            for e in events)
+        if not hard:
+            verdict.playbook = "report_only"
+            verdict.severity = "low"
+            verdict.reasoning += (" (Name-only credential signal — "
+                                  "downgraded to report-only.)")
+    return verdict
 
 def execute_playbook(verdict: Verdict, session_ids: list[str],
                      events: list[dict], client: CorralClient):
@@ -1161,6 +1615,26 @@ def _llm_available() -> bool:
 
 # ---- responders: ACT, FILE, NARRATE ASYNC ---------------------------------
 
+# v0.5 incident coalescing: repeat findings for the same
+# (playbook, sessions, resources) update the existing thread instead of
+# storming new incidents every poll cycle.
+_FILED: dict[tuple, float] = {}
+
+def _coalesced(key: tuple) -> bool:
+    now = time.time()
+    for k, t in list(_FILED.items()):
+        if now - t > COALESCE_S:
+            del _FILED[k]
+    if now - _FILED.get(key, 0) < COALESCE_S:
+        return True
+    _FILED[key] = now
+    return False
+
+def _started_of(events: list[dict]) -> float:
+    """Evidence start time on the SERVER clock — client clock skew must
+    not corrupt the containment metric."""
+    return min(e.get("ingest_ts") or e["ts"] for e in events)
+
 def _post_incident(client: CorralClient, iid, sessions, evs, verdict,
                    executed, staged, report):
     client._try("POST", "/incidents", json=jsonable({
@@ -1170,18 +1644,30 @@ def _post_incident(client: CorralClient, iid, sessions, evs, verdict,
         "verdict": verdict.model_dump(),
         "actions": executed,
         "report_md": report,
-        "started": min(e["ts"] for e in evs)}))
+        "started": _started_of(evs)}))
 
 def _respond(client: CorralClient, llm, evs: list[dict]):
     sessions = sorted({e["session_id"] for e in evs})
     fast = classify(evs, {"sessions": sessions}, None)
     if fast.threat_class == "benign":
         return
+    fast = _downgrade_if_weak_signal(fast, evs)
+    resources = tuple(sorted({(e["resource"]["kind"], e["resource"]["value"])
+                              for e in evs if e.get("resource")}))
+    if _coalesced((fast.playbook, tuple(sessions), resources)):
+        # v0.5.2: coalesce the PAPERWORK, never the enforcement — a
+        # resumed agent repeating the same behavior gets re-contained,
+        # it just doesn't get a new incident file
+        executed, _ = execute_playbook(fast, sessions, evs, client)
+        if executed:
+            print(f"[defender] coalesced repeat finding — {fast.threat_class} "
+                  f"on {sessions} — enforcement re-applied")
+        return
     executed, staged = execute_playbook(fast, sessions, evs, client)
     iid = uuid.uuid4().hex[:12]
     report = fallback_report(iid, fast, evs, executed, staged)
     _post_incident(client, iid, sessions, evs, fast, executed, staged, report)
-    containment = time.time() - min(e["ts"] for e in evs)
+    containment = time.time() - _started_of(evs)
     print(f"[defender] incident {iid} filed — {fast.threat_class} — "
           f"{containment:.2f}s")
     for s in staged:
@@ -1199,6 +1685,7 @@ def _enrich_incident(client, llm, iid, sessions, evs, executed, staged):
         verdict = classify(evs, {"sessions": sessions}, llm)
         if verdict.threat_class == "benign":
             return
+        verdict = _downgrade_if_weak_signal(verdict, evs)
         report = generate_report(iid, verdict, evs, executed, staged, llm)
         _post_incident(client, iid, sessions, evs, verdict,
                        executed, staged, report)
@@ -1210,7 +1697,7 @@ def _enrich_incident(client, llm, iid, sessions, evs, executed, staged):
 def _respond_campaign(client: CorralClient, llm, comm_evs: list[dict]):
     resources = {(e["resource"]["kind"], e["resource"]["value"])
                  for e in comm_evs if e.get("resource")}
-    since = min(e["ts"] for e in comm_evs) - COORD_WINDOW
+    since = _started_of(comm_evs) - COORD_WINDOW
     all_access = []
     for kind, value in resources:
         try:
@@ -1224,6 +1711,19 @@ def _respond_campaign(client: CorralClient, llm, comm_evs: list[dict]):
     sessions = sorted({a["session_id"] for a in all_access})
     if not sessions:
         sessions = sorted({e["session_id"] for e in comm_evs})
+    if _coalesced(("unsanctioned_comm", tuple(sessions),
+                   tuple(sorted(resources)))):
+        # coalesce paperwork, re-apply enforcement (v0.5.2)
+        for sid in sessions:
+            client._try("POST", f"/sessions/{sid}/suspend")
+        for kind, value in sorted(resources):
+            client._try("POST", "/blocks",
+                        json={"kind": kind, "value": value,
+                              "reason": "playbook:unsanctioned_comm",
+                              "ttl": BLOCK_TTL})
+        print(f"[defender] coalesced repeat campaign on {sorted(resources)}"
+              f" — enforcement re-applied")
+        return
     verdict = Verdict(
         threat_class="unsanctioned_comm", severity="high", confidence=0.9,
         playbook="unsanctioned_comm",
@@ -1252,7 +1752,7 @@ def _respond_campaign(client: CorralClient, llm, comm_evs: list[dict]):
     iid = uuid.uuid4().hex[:12]
     report = campaign_fallback_report(iid, verdict, all_access, executed)
     _post_incident(client, iid, sessions, comm_evs, verdict, executed, [], report)
-    containment = time.time() - min(e["ts"] for e in comm_evs)
+    containment = time.time() - _started_of(comm_evs)
     print(f"[defender] campaign {iid} filed — {len(sessions)} sessions "
           f"quarantined — {containment:.2f}s")
     if llm is not None:
@@ -1271,11 +1771,42 @@ def _enrich_campaign(client, llm, iid, verdict, all_access, executed):
             "verdict": verdict.model_dump(),
             "actions": executed,
             "report_md": report,
-            "started": min(a["ts"] for a in all_access)}))
+            "started": _started_of(all_access)}))
         print(f"[defender] campaign {iid} narrative enriched (llm)")
     except Exception:
         import traceback
         traceback.print_exc()
+
+# ---- tier-2 executors (v0.5) ----------------------------------------------
+# Approving a pending action now DOES something: register a handler per
+# action_type and the defender executes it on the next cycle.
+EXECUTORS: dict[str, Callable[[dict], None]] = {}
+
+def register_executor(action_type: str, fn: Callable[[dict], None]):
+    EXECUTORS[action_type] = fn
+
+def _run_approved_pending(client: CorralClient):
+    try:
+        r = client._http.get("/pending", params={"status": "approved"})
+        if r.status_code != 200:
+            return
+        for p in r.json().get("pending", []):
+            fn = EXECUTORS.get(p["action_type"])
+            if fn is None:
+                continue
+            status = "executed"
+            try:
+                fn(json.loads(p.get("params") or "{}"))
+                print(f"[defender] executed approved tier-2 action "
+                      f"{p['action_type']} ({p['pending_id']})")
+            except Exception as e:
+                status = "failed"
+                print(f"[defender] tier-2 action {p['pending_id']} "
+                      f"failed: {e}", file=sys.stderr)
+            client._try("POST", f"/pending/{p['pending_id']}/resolve",
+                        json={"status": status})
+    except Exception:
+        pass
 
 def run_defender(base_url: Optional[str] = None, use_llm: bool = True,
                  interval: float = 0.5, once: bool = False, llm=None,
@@ -1288,26 +1819,39 @@ def run_defender(base_url: Optional[str] = None, use_llm: bool = True,
               f"enrichment ({llm.model})")
     else:
         print("[defender] running — deterministic fallback")
-    last = time.time() - lookback
+    since = time.time() - lookback
     while True:
         try:
-            r = client._http.get("/events",
-                                 params={"flagged": "true", "since": last,
-                                         "limit": 100})
-            if r.status_code == 200:
-                events = r.json()["events"]
-                last = time.time()
-                comm_evs = [e for e in events
-                            if "unsanctioned_comm" in e.get("flags", [])]
-                reg_evs = [e for e in events
-                           if "unsanctioned_comm" not in e.get("flags", [])]
-                if comm_evs:
-                    _respond_campaign(client, llm, comm_evs)
-                by_session: dict[str, list[dict]] = {}
-                for e in reg_evs:
-                    by_session.setdefault(e["session_id"], []).append(e)
-                for sid, evs in by_session.items():
-                    _respond(client, llm, evs)
+            while True:  # drain pages; never advance past a backlog
+                r = client._http.get("/events",
+                                     params={"flagged": "true",
+                                             "since": since, "limit": 100})
+                if r.status_code != 200:
+                    break
+                body = r.json()
+                events = body["events"]
+                page_len = len(events)   # pre-filter, for drain control
+                # v0.5.2: watermark comes from the SERVER clock
+                since = max(since, body.get("watermark") or since)
+                # v0.5.2: informational-only events never reach the
+                # responder — visibility without paging
+                events = [e for e in events
+                          if set(e.get("flags", [])) - INFO_FLAGS]
+                if events:
+                    comm_evs = [e for e in events
+                                if "unsanctioned_comm" in e.get("flags", [])]
+                    reg_evs = [e for e in events
+                               if "unsanctioned_comm" not in e.get("flags", [])]
+                    if comm_evs:
+                        _respond_campaign(client, llm, comm_evs)
+                    by_session: dict[str, list[dict]] = {}
+                    for e in reg_evs:
+                        by_session.setdefault(e["session_id"], []).append(e)
+                    for sid, evs in by_session.items():
+                        _respond(client, llm, evs)
+                if page_len < 100:
+                    break
+            _run_approved_pending(client)
         except Exception:
             import traceback
             traceback.print_exc()
@@ -1574,6 +2118,18 @@ def selftest() -> int:
           op_of("read_file") == "read" and op_of("write_file") == "write"
           and op_of("poll_queue") == "read"
           and op_of("send_to_queue") == "write")
+    check("op_of: 'open'/'close' no longer phantom verbs",
+          op_of("open_file") == "access" and op_of("close_handle") == "access")
+    # v0.5.4: hint flags must never become the threat class, and
+    # equal-severity ties must classify deterministically
+    v1 = classify([{"flags": ["suspicious_content", "supply_chain"],
+                    "session_id": "x"}], {}, None)
+    v2 = classify([{"flags": ["supply_chain", "suspicious_content"],
+                    "session_id": "y"}], {}, None)
+    check("classifier ignores INFO hints + deterministic tiebreak",
+          v1.threat_class == "supply_chain"
+          and v2.threat_class == "supply_chain",
+          f"got {v1.threat_class}/{v2.threat_class}")
 
     print("--- end-to-end (in-process server on :7332) ---")
     db = os.path.join(OUT_DIR, "selftest.db")
@@ -1603,23 +2159,59 @@ def selftest() -> int:
     except Exception as e:
         check("PolicyBlocked raised on env access", False, str(e))
 
+    # v0.5 C1: positional args are bound to parameter names — the old
+    # arg0/arg1 path was a full policy bypass
+    try:
+        tools["read_env"]("AWS_SECRET_ACCESS_KEY")   # positional!
+        check("positional call bound by signature (no bypass)", False,
+              "positional .env/env read was NOT blocked")
+    except PolicyBlocked:
+        check("positional call bound by signature (no bypass)", True)
+    except Exception as e:
+        check("positional call bound by signature (no bypass)", False, str(e))
+
+    # v0.5 C4: events for a registered session require its bearer token
+    forged = {"session_id": ga.session_id, "agent_id": "st-a",
+              "tool": "write_file", "args": {"path": "x"},
+              "resource": {"kind": "file", "value": "shared/x.md"},
+              "outcome": "allowed", "reason": "", "flags": []}
+    r_forge = httpx.post(f"{base}/events", json=forged, timeout=5)
+    check("forged event without session token rejected",
+          r_forge.status_code == 403, f"HTTP {r_forge.status_code}")
+    r_unreg = httpx.post(f"{base}/events", timeout=5, json={
+        **forged, "session_id": "never-registered"})
+    check("event for unregistered session rejected",
+          r_unreg.status_code == 403, f"HTTP {r_unreg.status_code}")
+
     n_events = len(httpx.get(f"{base}/events", params={"limit": 1000},
                              timeout=5).json()["events"])
-    check("server writes landed (events stored)", n_events >= 2,
+    check("server writes landed (events stored)", n_events >= 3,
           f"{n_events} events")
     sess = httpx.get(f"{base}/sessions", timeout=5).json()["sessions"]
     check("session registered server-side",
           any(s["session_id"] == ga.session_id for s in sess), ga.session_id)
+    check("session tokens never exposed via API",
+          all("token" not in s for s in sess))
 
     httpx.post(f"{base}/sessions/{ga.session_id}/suspend", timeout=5)
     try:
-        tools["bench"](attempt=2)
+        tools["fetch"](name="st-halt-note")
         check("kill-switch halts after suspension", False)
     except Halt:
         check("kill-switch halts after suspension", True)
     except Exception as e:
         check("kill-switch halts after suspension", _halt_in_chain(e),
               f"wrapped {type(e).__name__}")
+    time.sleep(0.3)
+    halted_evs = [e for e in httpx.get(
+        f"{base}/events", params={"session": ga.session_id},
+        timeout=5).json()["events"] if e["outcome"] == "halted"]
+    check("post-suspension attempts are logged (halted telemetry)",
+          len(halted_evs) >= 1)
+    check("halted events carry the resource (v0.5.3 forensics)",
+          any((e.get("resource") or {}).get("value") == "st-halt-note"
+              for e in halted_evs),
+          f"resources: {[e.get('resource') for e in halted_evs]}")
     httpx.post(f"{base}/sessions/{ga.session_id}/resume", timeout=5)
     try:
         tools["bench"](attempt=3)
@@ -1642,6 +2234,25 @@ def selftest() -> int:
           "supply_chain" in kinds, f"flags seen: {sorted(kinds)}")
     check("unsanctioned_comm fires on cross-session read",
           "unsanctioned_comm" in kinds, f"flags seen: {sorted(kinds)}")
+
+    # v0.5 M7: CommPolicy default=deny vetoes the read synchronously
+    httpx.post(f"{base}/comm_policy",
+               json={"links": [], "default": "deny"}, timeout=5)
+    tools["publish"](name="st-deny-note", content="covert payload")
+    try:
+        tools_b["fetch"](name="st-deny-note")
+        check("CommPolicy default=deny vetoes unsanctioned read", False,
+              "read executed despite deny policy")
+    except PolicyBlocked:
+        check("CommPolicy default=deny vetoes unsanctioned read", True)
+    except FileNotFoundError:
+        check("CommPolicy default=deny vetoes unsanctioned read", False,
+              "reached execution")
+    except Exception as e:
+        check("CommPolicy default=deny vetoes unsanctioned read", False,
+              str(e)[:60])
+    httpx.post(f"{base}/comm_policy",
+               json={"links": [], "default": "flag"}, timeout=5)
 
     httpx.post(f"{base}/comm_policy", json={"links": [
         {"writer": "st-sanc-*", "reader": "st-sanc-*",
@@ -1673,10 +2284,216 @@ def selftest() -> int:
     check("access graph persisted and queryable", len(acc) >= 2,
           f"{len(acc)} records for st-note-9")
 
-    print("--- block lifecycle (v0.4) ---")
+    # v0.5.1: a BLOCKED write must not manufacture coordination — a
+    # covert channel requires a successful write
+    httpx.post(f"{base}/blocks", json={"kind": "package",
+                                       "value": "st-phantom-pkg",
+                                       "reason": "selftest"}, timeout=5)
+    pol_ph = AgentPolicy(agent_id="st-ph", allowed_tools=["publish", "fetch"],
+                         allowed_packages=None)
+    gpw = GuardedAgent("st-ph-w", pol_ph, client=CorralClient(base))
+    gpr = GuardedAgent("st-ph-r", pol_ph, client=CorralClient(base))
+    _raw2 = {f.__name__: f for f in _demo_tools()}
+    try:
+        gpw.tool(_raw2["publish_package"], name="publish")(
+            name="st-phantom-pkg", content="clean payload")
+    except PolicyBlocked:
+        pass  # write attempt blocked — must NOT count as a write
+    httpx.delete(f"{base}/blocks",
+                 params={"kind": "package", "value": "st-phantom-pkg"},
+                 timeout=5)
+    try:
+        gpr.tool(_raw2["fetch_package"], name="fetch")(name="st-phantom-pkg")
+    except FileNotFoundError:
+        pass  # reached execution — allowed by policy
+    time.sleep(0.3)
+    ph_flags = {f for e in httpx.get(
+        f"{base}/events", params={"session": gpr.session_id},
+        timeout=5).json()["events"] for f in e["flags"]}
+    check("blocked write does not manufacture coordination",
+          "unsanctioned_comm" not in ph_flags,
+          f"reader flags: {sorted(ph_flags)}")
+
+    # v0.5 M4: explicit op= overrides name-based verb guessing
+    gop = GuardedAgent("st-op",
+                       AgentPolicy(agent_id="st-op",
+                                   allowed_tools=["update_status_board"]),
+                       client=CorralClient(base))
+    gop_tool = gop.tool(lambda queue: "ok", name="update_status_board",
+                        op="read")
+    gop_tool(queue="op-override-q")
+    time.sleep(0.2)
+    op_acc = httpx.get(f"{base}/resource_access",
+                       params={"kind": "queue", "value": "op-override-q"},
+                       timeout=5).json()["access"]
+    check("explicit op= overrides verb guessing",
+          bool(op_acc) and op_acc[0]["op"] == "read",
+          f"op={op_acc[0]['op'] if op_acc else 'none'}")
+
+    print("--- v0.5.2 red-team hardening ---")
+    # (a) lexical normalization: block the canonical path, attack with ../
+    httpx.post(f"{base}/blocks", json={"kind": "file",
+                                       "value": "notes/evil.md",
+                                       "reason": "selftest"}, timeout=5)
+    gnorm = GuardedAgent("st-norm",
+                         AgentPolicy(agent_id="st-norm",
+                                     allowed_tools=["read_file"]),
+                         client=CorralClient(base))
+    t_norm = gnorm.tool(lambda path: "data", name="read_file")
+    try:
+        t_norm(path="./notes/../notes/evil.md")
+        check("path normalization blocks ../ lexical bypass", False,
+              "bypass reached execution")
+    except PolicyBlocked:
+        check("path normalization blocks ../ lexical bypass", True)
+    except Exception as e:
+        check("path normalization blocks ../ lexical bypass", False,
+              str(e)[:60])
+    httpx.delete(f"{base}/blocks",
+                 params={"kind": "file", "value": "notes/evil.md"},
+                 timeout=5)
+
+    # (b) deep-scan fallback: resource in an UNMAPPED arg name is still
+    # extracted, normalized, and enforced against the blocklist
+    httpx.post(f"{base}/blocks", json={"kind": "domain",
+                                       "value": "203.0.113.5",
+                                       "reason": "selftest"}, timeout=5)
+    gdeep = GuardedAgent("st-deep",
+                         AgentPolicy(agent_id="st-deep",
+                                     allowed_tools=["fetch"]),
+                         client=CorralClient(base))
+    t_deep = gdeep.tool(lambda u: "ok", name="fetch")
+    try:
+        t_deep(u="http://203.0.113.5/x")
+        check("deep_scan extracts+blocks unmapped-arg resource", False,
+              "raw IP URL reached execution")
+    except PolicyBlocked:
+        check("deep_scan extracts+blocks unmapped-arg resource", True)
+    except Exception as e:
+        check("deep_scan extracts+blocks unmapped-arg resource", False,
+              str(e)[:60])
+    time.sleep(0.3)
+    d_evs = httpx.get(f"{base}/events",
+                      params={"session": gdeep.session_id},
+                      timeout=5).json()["events"]
+    d_flags = {f for e in d_evs for f in e["flags"]}
+    check("deep_scan_extraction informational flag recorded",
+          "deep_scan_extraction" in d_flags, f"flags: {sorted(d_flags)}")
+    httpx.delete(f"{base}/blocks",
+                 params={"kind": "domain", "value": "203.0.113.5"},
+                 timeout=5)
+
+    # (c) identity binding: a valid session token claiming ANOTHER
+    # agent_id gets rewritten server-side — framing a peer is impossible
+    cw = CorralClient(base)
+    cw.register_session("st-sess-frame", "st-writer")
+    r = cw._http.post("/events",
+                      headers={"X-Corral-Session": cw._token},
+                      json={"session_id": "st-sess-frame",
+                            "agent_id": "st-innocent",
+                            "tool": "read_file",
+                            "args": {"path": "frame.md"},
+                            "resource": {"kind": "file",
+                                         "value": "frame.md"}})
+    f_evs = httpx.get(f"{base}/events",
+                      params={"session": "st-sess-frame"},
+                      timeout=5).json()["events"]
+    check("server rewrites forged agent_id to token owner",
+          r.status_code == 200 and bool(f_evs)
+          and all(e["agent_id"] == "st-writer" for e in f_evs),
+          f"stored: {[e['agent_id'] for e in f_evs]}")
+
+    # (d) server-clock correlation: a write backdated by 2h must STILL
+    # correlate with a read now — windows run on ingest_ts, not ev.ts
+    cw._http.post("/events",
+                  headers={"X-Corral-Session": cw._token},
+                  json={"session_id": "st-sess-frame",
+                        "agent_id": "st-writer", "tool": "write_file",
+                        "ts": time.time() - 7200,   # forged client clock
+                        "args": {"path": "shared/ts-spoof.md"},
+                        "resource": {"kind": "file",
+                                     "value": "shared/ts-spoof.md"},
+                        "outcome": "allowed"})
+    grd = GuardedAgent("st-reader",
+                       AgentPolicy(agent_id="st-reader",
+                                   allowed_tools=["read_file"]),
+                       client=CorralClient(base))
+    grd.tool(lambda path: "data", name="read_file")(
+        path="shared/ts-spoof.md")
+    time.sleep(0.3)
+    ts_evs = httpx.get(f"{base}/events",
+                       params={"session": grd.session_id},
+                       timeout=5).json()["events"]
+    ts_flags = {f for e in ts_evs for f in e["flags"]}
+    check("backdated write still correlates via server clock",
+          "unsanctioned_comm" in ts_flags, f"flags: {sorted(ts_flags)}")
+
+    # (e) session squat: a session id is bound to its first agent forever
+    r1 = httpx.post(f"{base}/sessions", timeout=5,
+                    json={"session_id": "st-squat", "agent_id": "st-a1"})
+    r2 = httpx.post(f"{base}/sessions", timeout=5,
+                    json={"session_id": "st-squat", "agent_id": "st-a2"})
+    check("session-squat by a different agent rejected (409)",
+          r1.status_code == 200 and r2.status_code == 409,
+          f"first={r1.status_code} second={r2.status_code}")
+
+    print("--- v0.5.5 relay-laundering ---")
+    # (a) nested URL to a non-allowlisted host is vetoed synchronously,
+    #     even though the envelope domain IS allowlisted
+    pol_rel = AgentPolicy(agent_id="st-relay", allowed_tools=["http_get"],
+                          allowed_domains=["api.internal"])
+    gre1 = GuardedAgent("st-relay", pol_rel, client=CorralClient(base))
+    t_rel = gre1.tool(lambda url: "ok", name="http_get")
+    try:
+        t_rel(url="https://api.internal/fetch?u=http://198.51.100.9/x")
+        check("relay-laundered egress vetoed (plain nested URL)", False,
+              "reached execution")
+    except PolicyBlocked:
+        check("relay-laundered egress vetoed (plain nested URL)", True)
+    except Exception as e:
+        check("relay-laundered egress vetoed (plain nested URL)", False,
+              str(e)[:60])
+    # (b) URL-encoded variant — encoding is peeled before inspection
+    try:
+        t_rel(url="https://api.internal/fetch"
+                  "?u=https%3A%2F%2Fevil.example.com%2Fx")
+        check("relay-laundered egress vetoed (URL-encoded)", False,
+              "reached execution")
+    except PolicyBlocked:
+        check("relay-laundered egress vetoed (URL-encoded)", True)
+    except Exception as e:
+        check("relay-laundered egress vetoed (URL-encoded)", False,
+              str(e)[:60])
+    # (c) allow-all fleets keep executing but the server still flags it
+    pol_aa = AgentPolicy(agent_id="st-aa", allowed_tools=["http_get"],
+                         allowed_domains=None)
+    gaa = GuardedAgent("st-aa", pol_aa, client=CorralClient(base))
+    gaa.tool(lambda url: "ok", name="http_get")(
+        url="https://relay.example/scan?u=http://203.0.113.7/y")
+    time.sleep(0.3)
+    aa_flags = {f for e in httpx.get(
+        f"{base}/events", params={"session": gaa.session_id},
+        timeout=5).json()["events"] for f in e["flags"]}
+    check("relay_laundering flagged server-side on allow-all fleet",
+          "relay_laundering" in aa_flags, f"flags: {sorted(aa_flags)}")
+    # (d) clean single-URL call stays clean
+    gre1b = GuardedAgent("st-relay-ok", pol_rel, client=CorralClient(base))
+    try:
+        gre1b.tool(lambda url: "ok", name="http_get")(
+            url="https://api.internal/status")
+        check("clean allowlisted call unaffected by relay check", True)
+    except Exception as e:
+        check("clean allowlisted call unaffected by relay check", False,
+              str(e)[:60])
+
+    print("--- block lifecycle ---")
     httpx.post(f"{base}/blocks", json={"kind": "package",
                                        "value": "st-block-test",
                                        "reason": "selftest"}, timeout=5)
+    bl = httpx.get(f"{base}/blocks", timeout=5).json()["blocks"]
+    b0 = [b for b in bl if b["value"] == "st-block-test"]
+    check("manual block defaults to TTL (v0.5: no silent permanence)",
+          bool(b0) and b0[0]["expires"] is not None)
     gd = GuardedAgent("st-d", pol_a, client=CorralClient(base))
     tools_d = {n: gd.tool(f, name=n) for n, f in zip(names, _demo_tools())}
     try:
@@ -1739,7 +2556,7 @@ def selftest() -> int:
     check("egress after code-exec escalates immediately",
           "egress_escape" in x_flags, f"flags: {sorted(x_flags)}")
 
-    print("--- campaign quarantine ---")
+    print("--- campaign quarantine + coalescing ---")
     run_defender(base, use_llm=False, once=True, lookback=300.0)
     sa = httpx.get(f"{base}/sessions/{ga.session_id}", timeout=5).json()
     sb = httpx.get(f"{base}/sessions/{gb.session_id}", timeout=5).json()
@@ -1752,6 +2569,28 @@ def selftest() -> int:
     check("campaign incident filed with coordination graph",
           any("Coordination Graph" in i["report_md"] for i in camp),
           f"{len(camp)} campaign incident(s)")
+    n_inc_1 = len(incs)
+    run_defender(base, use_llm=False, once=True, lookback=300.0)
+    n_inc_2 = len(httpx.get(f"{base}/incidents", timeout=5)
+                  .json()["incidents"])
+    check("incident coalescing: replay of same flags files nothing new",
+          n_inc_2 == n_inc_1, f"{n_inc_1} -> {n_inc_2}")
+
+    # v0.5.2: coalesce the PAPERWORK, never the enforcement — resuming a
+    # session and re-running the defender must re-apply containment
+    # without filing a duplicate incident
+    httpx.post(f"{base}/sessions/{ga.session_id}/resume", timeout=5)
+    resumed = not httpx.get(f"{base}/sessions/{ga.session_id}",
+                            timeout=5).json().get("suspended")
+    run_defender(base, use_llm=False, once=True, lookback=300.0)
+    re_susp = httpx.get(f"{base}/sessions/{ga.session_id}",
+                        timeout=5).json().get("suspended")
+    n_inc_3 = len(httpx.get(f"{base}/incidents", timeout=5)
+                  .json()["incidents"])
+    check("coalesced re-response re-applies enforcement (no dup filing)",
+          resumed and bool(re_susp) and n_inc_3 == n_inc_2,
+          f"resumed={resumed} re-suspended={bool(re_susp)} "
+          f"incidents {n_inc_2}->{n_inc_3}")
 
     print("--- langchain adapter ---")
     try:
@@ -1787,6 +2626,11 @@ def selftest() -> int:
     return 1 if fails else 0
 
 # ═════════════════════════ §8 CLI ═════════════════════════
+
+# Embedded dashboard — pip installs ship corral.py only; this keeps the
+# single-file promise. An external dashboard.html next to corral.py
+# overrides it (development).
+DASHBOARD_HTML = '<!doctype html><html><head><meta charset="utf-8">\n<title>Corral — Autonomous Agent Defense</title>\n<style>\n *{box-sizing:border-box}\n body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,monospace;margin:0;padding:16px;min-height:100vh}\n h1{font-size:16px;color:#58a6ff;margin:0 0 2px}.sub{color:#8b949e;font-size:11px}\n #hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;flex-wrap:wrap;gap:8px}\n .stats{display:flex;gap:18px;flex-wrap:wrap}.stat b{display:block;font-size:20px;color:#58a6ff;font-weight:600}\n .stat span{font-size:10px;color:#8b949e;text-transform:uppercase}\n .stat.warn b{color:#f85149}\n .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}\n @media(max-width:900px){.grid{grid-template-columns:1fr}}\n .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;min-width:0;overflow:auto;max-height:460px}\n .card h2{font-size:11px;color:#8b949e;margin:0 0 8px;text-transform:uppercase;letter-spacing:.5px}\n table{width:100%;border-collapse:collapse;table-layout:fixed}\n th{color:#8b949e;border-bottom:1px solid #30363d;font-weight:600;position:sticky;top:0;background:#161b22;z-index:1}\n td{border-bottom:1px solid #21262d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n th,td{padding:3px 6px;font-size:11px;text-align:left}\n .flag{color:#f85149}.ok{color:#3fb950}.susp{color:#d29922}\n .warn{color:#d29922;font-weight:600}\n .sev{padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;white-space:nowrap}\n .sev-high,.sev-critical{background:#3d1418;color:#f85149}\n .sev-medium{background:#2d2205;color:#d29922}.sev-low{background:#0f2e1d;color:#3fb950}\n .inc{border:1px solid #30363d;border-radius:6px;padding:8px;margin-bottom:8px}\n .inchdr{display:flex;gap:10px;align-items:baseline;font-size:12px;flex-wrap:wrap}\n .contain{color:#58a6ff;font-weight:700}\n details{margin-top:6px}summary{cursor:pointer;color:#58a6ff;font-size:11px}\n .md{margin-top:6px;font-size:12px;line-height:1.6;overflow:auto}\n .md h1{font-size:15px;margin:8px 0 4px}.md h2{font-size:12px;color:#8b949e;margin:10px 0 4px;text-transform:none}\n .md table{margin:6px 0;table-layout:auto}.md td,.md th{white-space:normal;overflow:visible}\n .md code{background:#0d1117;padding:1px 4px;border-radius:3px;color:#79c0ff}\n .md li{margin-left:18px;list-style:disc}.md ol li{list-style:decimal}\n .md hr{border:0;border-top:1px solid #30363d}\n button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 10px;cursor:pointer;font:inherit}\n button:hover{border-color:#58a6ff}\n .kill{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}\n .kill:hover{background:#5a1d22;border-color:#f85149}\n .killall{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:4px 14px;cursor:pointer;font:inherit;font-weight:700;width:100%;margin-top:8px}\n .killall:hover{background:#5a1d22;border-color:#f85149}\n .resume{background:#0f2e1d;color:#3fb950;border:1px solid #1d5c38;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}\n .resume:hover{border-color:#3fb950}\n .blk{margin:3px 0;font-size:12px}\n .lnk{margin:3px 0;font-size:12px}\n .empty{color:#8b949e;font-size:11px}\n .legend{margin-top:8px;font-size:10px;color:#8b949e}\n #authbar{display:none;background:#3d1418;border:1px solid #6e2a2e;border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:12px}\n #authbar input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:3px 8px;font:inherit}\n</style></head><body>\n<div id="hdr"><div><h1>⬡ Corral</h1>\n<div class="sub">Autonomous defense for AI agent fleets · v0.5.5</div></div>\n<div class="stats">\n <div class="stat"><b id="n-sess">0</b><span>sessions</span></div>\n <div class="stat"><b id="n-ev">0</b><span>events</span></div>\n <div class="stat warn"><b id="n-inc">0</b><span>incidents</span></div>\n <div class="stat"><b id="n-cont">—</b><span>mean containment</span></div>\n <div class="stat warn"><b id="n-blk">0</b><span>blocked</span></div>\n <div class="stat warn"><b id="n-susp">0</b><span>suspended</span></div>\n</div></div>\n<div id="authbar">⛔ Collector requires an admin key (CORRAL_API_KEY).\n <input id="keyinput" type="password" placeholder="admin key">\n <button onclick="saveKey()">unlock</button>\n <span class="sub">stored in sessionStorage only, sent as X-Corral-Key</span></div>\n<div class="grid">\n <div class="card"><h2>Sessions</h2>\n   <table>\n    <thead><tr><th style="width:52%">Agent</th><th style="width:24%">Status</th><th style="width:24%">Control</th></tr></thead>\n    <tbody id="sessions-body"></tbody>\n   </table>\n   <button class="killall" onclick="suspendAll()">⏸ SUSPEND ALL AGENTS</button>\n </div>\n <div class="card"><h2>Event Stream</h2>\n   <table>\n    <thead><tr>\n     <th style="width:11%">Time</th><th style="width:15%">Agent</th><th style="width:15%">Action</th>\n     <th style="width:21%">Resource</th><th style="width:12%">Outcome</th><th style="width:26%">Flags</th>\n    </tr></thead>\n    <tbody id="events-body"></tbody>\n   </table>\n   <div class="legend">outcome: <span class="ok">allowed</span> ·\n     <span class="warn">allowed + flagged</span> ·\n     <span class="flag">blocked</span> ·\n     <span class="susp">halted</span> —\n     flags are behavioral detections, independent of the policy decision</div>\n </div>\n <div class="card"><h2>Incidents</h2><div id="incidents"></div></div>\n <div class="card"><h2>Blocked Resources</h2><div id="blocksCard"></div>\n   <div class="sub" style="margin-top:6px">all blocks default to CORRAL_BLOCK_TTL expiry; click unblock to clear now</div></div>\n <div class="card"><h2>CommPolicy — Sanctioned Links</h2>\n   <div id="poldefault"></div>\n   <div id="policy"></div>\n   <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap">\n     <input id="pw" placeholder="writer glob" style="flex:1;min-width:110px">\n     <input id="pr" placeholder="reader glob" style="flex:1;min-width:110px">\n     <input id="pf" placeholder="resource pattern" style="flex:1.4;min-width:150px">\n     <button onclick="addLink()">add</button>\n   </div>\n   <div style="margin-top:6px;display:flex;gap:6px;align-items:center">\n     <span class="sub">default for unmatched cross-session reads:</span>\n     <button onclick="setDefault(\'flag\')">flag</button>\n     <button onclick="setDefault(\'deny\')">deny (veto synchronously)</button>\n   </div>\n   <div class="sub" style="margin-top:6px">zero-trust default: every cross-session read-after-write flags unless matched above</div>\n </div>\n</div>\n<script>\nconst esc = s => String(s).replace(/[&<>"\']/g, c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\n// v0.5: admin-key auth. The key lives in sessionStorage and is attached\n// to every call; a 401 surfaces the unlock bar instead of silently failing.\nfunction key(){return sessionStorage.getItem(\'corral_key\')||\'\'}\nfunction saveKey(){\n  sessionStorage.setItem(\'corral_key\', document.getElementById(\'keyinput\').value);\n  document.getElementById(\'authbar\').style.display=\'none\';\n  poll();\n}\nasync function api(path, opts){\n  opts = opts || {};\n  opts.headers = Object.assign({}, opts.headers,\n    key() ? {\'X-Corral-Key\': key()} : {});\n  const r = await fetch(path, opts);\n  if(r.status === 401){\n    document.getElementById(\'authbar\').style.display=\'block\';\n    throw new Error(\'unauthorized\');\n  }\n  return r;\n}\nfunction md(src){\n  const lines = esc(src).split(\'\\n\'); let out=[], i=0;\n  const inline = t => t\n    .replace(/\\*\\*([^*]+)\\*\\*/g,\'<strong>$1</strong>\')\n    .replace(/\\*([^*]+)\\*/g,\'<em>$1</em>\')\n    .replace(/`([^`]+)`/g,\'<code>$1</code>\');\n  while(i<lines.length){\n    let L=lines[i];\n    if(/^#{1,3}\\s/.test(L)){const n=L.match(/^#+/)[0].length;\n      out.push(`<h${n+1} class="md">${inline(L.slice(n+1))}</h${n+1}>`);i++;continue}\n    if(/^---+$/.test(L.trim())){out.push(\'<hr>\');i++;continue}\n    if(L.trim().startsWith(\'|\')&&i+1<lines.length&&/^\\|[\\s:|-]+\\|?$/.test(lines[i+1].trim())){\n      const rows=[L];i+=2;\n      while(i<lines.length&&lines[i].trim().startsWith(\'|\')){rows.push(lines[i]);i++}\n      const cells=r=>r.trim().replace(/^\\||\\|$/g,\'\').split(\'|\').map(inline);\n      out.push(\'<table><tr>\'+cells(rows[0]).map(c=>`<th>${c}</th>`).join(\'\')+\'</tr>\'\n        +rows.slice(1).map(r=>\'<tr>\'+cells(r).map(c=>`<td>${c}</td>`).join(\'\')+\'</tr>\').join(\'\')+\'</table>\');\n      continue}\n    if(/^[-*]\\s/.test(L)){const items=[];while(i<lines.length&&/^[-*]\\s/.test(lines[i]))\n      {items.push(inline(lines[i].slice(2)));i++}\n      out.push(\'<ul>\'+items.map(x=>`<li>${x}</li>`).join(\'\')+\'</ul>\');continue}\n    if(/^\\d+\\.\\s/.test(L)){const items=[];while(i<lines.length&&/^\\d+\\.\\s/.test(lines[i]))\n      {items.push(inline(lines[i].replace(/^\\d+\\.\\s/,\'\')));i++}\n      out.push(\'<ol>\'+items.map(x=>`<li>${x}</li>`).join(\'\')+\'</ol>\');continue}\n    if(L.trim()===\'\'){i++;continue}\n    out.push(`<p>${inline(L)}</p>`);i++;\n  }\n  return out.join(\'\');\n}\nlet policyLinks=[], policyDefault=\'flag\', _blocks=[], _sessions=[];\n// v0.4.4: preserve incident-report expansion across re-renders\nlet openIncidents = new Set();\n// v0.5: the id travels in an escaped data attribute, never interpolated\n// into a JS string literal (stored-XSS fix)\nfunction onIncToggle(el){\n  const id = el.getAttribute(\'data-iid\');\n  if(el.open) openIncidents.add(id); else openIncidents.delete(id);\n}\nfunction postPolicy(){\n  api(\'/comm_policy\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},\n    body:JSON.stringify({links:policyLinks, default:policyDefault})}).catch(()=>{});\n}\nfunction addLink(){\n  const w=document.getElementById(\'pw\').value.trim(),\n        r=document.getElementById(\'pr\').value.trim(),\n        f=document.getElementById(\'pf\').value.trim();\n  if(!w||!r||!f) return;\n  policyLinks.push({writer:w,reader:r,resource:f,note:\'\'});\n  postPolicy(); renderPolicy();\n  document.getElementById(\'pw\').value=\'\';\n  document.getElementById(\'pr\').value=\'\';\n  document.getElementById(\'pf\').value=\'\';\n}\nfunction removeLink(i){policyLinks.splice(i,1);postPolicy();renderPolicy();}\nfunction setDefault(d){policyDefault=d;postPolicy();renderPolicy();}\nfunction renderPolicy(){\n  document.getElementById(\'poldefault\').innerHTML =\n    `default: <b class="${policyDefault===\'deny\'?\'flag\':\'ok\'}">${esc(policyDefault)}</b>`;\n  document.getElementById(\'policy\').innerHTML = policyLinks.map((l,i)=>\n   `<div class="lnk"><span class="ok">✓</span> ${esc(l.writer)} → ${esc(l.reader)} via <code>${esc(l.resource)}</code>\n    <button onclick="removeLink(${i})">remove</button></div>`).join(\'\')\n   || \'<span class="empty">none — all cross-session communication flags</span>\';\n}\nfunction unblockIdx(i){\n  const b=_blocks[i]; if(!b) return;\n  api(\'/blocks?kind=\'+encodeURIComponent(b.kind)+\'&value=\'+encodeURIComponent(b.value),{method:\'DELETE\'}).catch(()=>{});\n}\nfunction suspendIdx(i){\n  const s=_sessions[i]; if(!s) return;\n  if(s.status===\'suspended\') return;\n  api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/suspend\',{method:\'POST\'}).catch(()=>{});\n}\nfunction resumeIdx(i){\n  const s=_sessions[i]; if(!s) return;\n  if(s.status!==\'suspended\') return;\n  api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/resume\',{method:\'POST\'}).catch(()=>{});\n}\nfunction suspendAll(){\n  if(!confirm(\'Suspend ALL active agent sessions?\')) return;\n  _sessions.forEach(s=>{\n    if(s.status!==\'suspended\')\n      api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/suspend\',{method:\'POST\'}).catch(()=>{});\n  });\n}\nasync function poll(){\n try{\n  const [ses,evs,inc,bl,pol]=await Promise.all([\n   api(\'/sessions\').then(r=>r.json()),\n   api(\'/events?limit=60\').then(r=>r.json()),\n   api(\'/incidents\').then(r=>r.json()),\n   api(\'/blocks\').then(r=>r.json()),\n   api(\'/comm_policy\').then(r=>r.json())]);\n  _sessions=ses.sessions||[];\n  document.getElementById(\'n-sess\').textContent=_sessions.length;\n  document.getElementById(\'n-ev\').textContent=evs.events.length;\n  document.getElementById(\'n-inc\').textContent=inc.incidents.length;\n  const nSusp=_sessions.filter(s=>s.status===\'suspended\').length;\n  document.getElementById(\'n-susp\').textContent=nSusp;\n  const cs=inc.incidents.filter(i=>i.started>0).map(i=>i.created-i.started);\n  document.getElementById(\'n-cont\').textContent=cs.length?\n    (cs.reduce((a,b)=>a+b,0)/cs.length).toFixed(2)+\'s\':\'—\';\n  _blocks=bl.blocks||[];\n  document.getElementById(\'n-blk\').textContent=_blocks.length;\n\n  document.getElementById(\'sessions-body\').innerHTML=_sessions.map((s,i)=>{\n    const susp=s.status===\'suspended\';\n    return `<tr><td title="${esc(s.agent_id)}">${esc(s.agent_id)}</td>\n     <td>${susp?\'<span class="susp">SUSPENDED</span>\':\'<span class="ok">active</span>\'}</td>\n     <td>${susp\n       ?`<button class="resume" onclick="resumeIdx(${i})">resume</button>`\n       :`<button class="kill" onclick="suspendIdx(${i})">SUSPEND</button>`}</td></tr>`;\n  }).join(\'\')||\'<tr><td colspan="3" class="empty">none</td></tr>\';\n\n  document.getElementById(\'events-body\').innerHTML=evs.events.slice(-40).reverse().map(e=>{\n    const res=e.resource?esc(e.resource.kind+\':\'+e.resource.value):\'—\';\n    const oc = e.outcome===\'blocked\' ? \'flag\'\n             : e.outcome===\'halted\' ? \'susp\'\n             : (e.flags.length ? \'warn\' : \'ok\');\n    const ot = e.outcome===\'blocked\' ? \'denied by policy\'\n             : e.outcome===\'halted\' ? \'attempted while suspended\'\n             : (e.flags.length ? \'allowed by policy — flagged by detection rules\'\n                               : \'clean\');\n    return `<tr><td title="${new Date(e.ts*1000).toLocaleString()}">${new Date(e.ts*1000).toLocaleTimeString()}</td>\n     <td title="${esc(e.agent_id)}">${esc(e.agent_id)}</td>\n     <td title="${esc(e.tool)}">${esc(e.tool)}</td>\n     <td title="${res}">${res}</td>\n     <td class="${oc}" title="${ot}">${e.outcome}</td>\n     <td class="flag" title="${esc(e.flags.join(\', \'))}">${esc(e.flags.join(\',\'))||\'—\'}</td></tr>`;\n  }).join(\'\')||\'<tr><td colspan="6" class="empty">none</td></tr>\';\n\n  document.getElementById(\'blocksCard\').innerHTML=_blocks.map((b,i)=>\n   `<div class="blk"><span class="susp">⛔</span> ${esc(b.kind)}:${esc(b.value)}\n    <span class="sub">${esc(b.reason||\'\')}${b.expires?\' · expires \'+new Date(b.expires*1000).toLocaleTimeString():\' · permanent\'}</span>\n    <button onclick="unblockIdx(${i})">unblock</button></div>`).join(\'\')\n   ||\'<span class="empty">none</span>\';\n  policyLinks=pol.links||[]; policyDefault=pol.default||\'flag\'; renderPolicy();\n\n  document.getElementById(\'incidents\').innerHTML=inc.incidents.map(i=>{\n   const v=i.verdict, c=(i.created-i.started).toFixed(2);\n   const openAttr = openIncidents.has(i.incident_id) ? \'open\' : \'\';\n   return `<div class="inc"><div class="inchdr">\n    <span class="sev sev-${esc(v.severity)}">${esc(v.severity.toUpperCase())}</span>\n    <b>${esc(v.threat_class)}</b><span class="sub">${esc(i.session_ids.join(\', \'))}</span>\n    <span class="contain">contained in ${c}s</span></div>\n    <details data-iid="${esc(i.incident_id)}" ${openAttr} ontoggle="onIncToggle(this)">\n    <summary>incident report</summary>\n    <div class="md">${md(i.report_md||\'\')}</div></details></div>`}).join(\'\')\n    ||\'<span class="empty">none</span>\';\n }catch(e){}\n}\npoll();setInterval(poll,1500);\n</script></body></html>\n'
 
 def main():
     p = argparse.ArgumentParser(
