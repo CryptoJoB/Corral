@@ -4,24 +4,42 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "corral"
-version = "0.5.5"
+version = "1.0.1"
 description = "Autonomous defense for AI agent fleets — single file, zero-trust inter-agent communication"
 readme = "README.md"
 requires-python = ">=3.10"
-# NOTE: choose and add a license before publishing (license = {text = "..."}).
-# NOTE: the name "corral" collides with existing projects on PyPI and
-# GitHub — decide on the distribution name before `pip publish`.
+license = {text = "MIT"}  
+authors = [
+    {name = "Joe Barnier"},        
+    ]
+keywords = ["ai-agents", "llm-security", "agentic-ai", "zero-trust",
+            "detection", "containment", "security"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "pydantic>=2.5",
     "httpx>=0.25",
     "fastapi>=0.104",
     "uvicorn>=0.24",
+    "langchain>=0.1"
 ]
+
+
+[project.urls]
+Repository = "https://github.com/CryptoJoB/Corral"   
+Documentation = "https://github.com/CryptoJoB/Corral/blob/main/README.md"
+Issues = "https://github.com/CryptoJoB/Corral/issues"
 
 [project.scripts]
 corral = "corral:main"
 
 [tool.setuptools]
 py-modules = ["corral"]
-# dashboard.html is embedded in corral.py (DASHBOARD_HTML); the external
-# file, when present next to corral.py, overrides it for development.
+
