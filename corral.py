@@ -2,6 +2,61 @@
 """
 corral — autonomous defense for AI agent fleets. Single file. Auditable.
 
+v1.0.4 "Fleet" (beta) — external red-team, round 2
+  The external reviewer re-ran every probe against v1.0.3 and found
+  that the new mechanisms had added attack surface of their own.
+  Everything found shipped here, each with a selftest regression;
+  what remains architectural (tiered failure modes, per-run
+  namespaces, write-once shared stores, a strong-model adversarial
+  eval) is named in the README.
+  FIX  denied attempts fleet-blocked services: a rogue allowed only
+       registry.internal made 3 denied calls to api.internal/v1/health
+       and the defender blocked the endpoint for everyone. Blocks are
+       now SCOPED — only resources an agent SUCCESSFULLY used
+       (outcome=allowed) are fleet-blocked; denied attempts earn an
+       agent-scoped block the rest of the fleet never sees
+  FIX  identity claiming suspended the real agent: with no
+       CORRAL_AGENT_KEYS a host could claim orchestrator-1, trip a
+       detector, and agent-level quarantine (v1.0.3) suspended the
+       victim. corral server now REFUSES to run without per-agent
+       keys unless CORRAL_OPEN_IDENTITY=1 is set explicitly
+  FIX  versioned-API false positive: /v1/metrics and /v1/docs shared
+       the coord api.internal/v1 — generic first segments (v1, api,
+       rest, svc) now extend the coordination identity to two segments
+  FIX  package-install false positive: two agents running
+       install_package("pandas") manufactured a channel under
+       unknown-verb-means-both. Kind-aware defaults: installs are
+       registry READS, only publishing-shaped verbs are writes
+  FIX  bare-host health checks flagged: the listing correlation now
+       requires writes to ≥2 DISTINCT endpoints (a real listing has
+       message variety; check_health(host=...) has none)
+  FIX  prefix-padding evasion: a reader's own 60 junk writes pushed
+       the real message past the children query's unordered LIMIT 50 —
+       the query now excludes the reader's own rows in SQL, orders by
+       recency, and raises the bound
+  FIX  fingerprint blind spots: bytes and dict/list results are
+       fingerprinted (canonical serialization), EVERY long argument is
+       registered (not just the first), the floor dropped to 32 chars
+       (CORRAL_FP_MIN_CHARS), and hex/base64 blobs inside larger
+       documents shingle via 16-char chunk hashes
+  FIX  auth gaps: with only CORRAL_INGEST_KEY set the admin surface
+       was open (unauthenticated POST /comm_policy returned 200) — it
+       now fails CLOSED; /comm_policy/proposals is admin-only and
+       validated (wildcard links rejected)
+  FIX  benign-list whole-path exemption: /app/environments/prod/.env
+       was allowed because "environment" appeared anywhere in the
+       path — the exemption now covers only the matched token itself
+  FIX  canary list readable in the agent process (corral.CANARIES):
+       the list is read from the SERVER's own env at startup into
+       server-local state; the SDK never holds it; matching is
+       server-side only
+  FIX  150-agent loadtest collapse: SQLite moved to WAL +
+       synchronous=NORMAL + busy_timeout with hot-path indexes (the
+       journal fsync per event serialized the fleet), and the defender
+       survives a saturated collector (long read timeout, per-page
+       fault isolation, backoff — the watermark never skips events).
+       150 agents: precision held, zero collateral, no lost events
+
 v1.0.3 "Fleet" (production) — self red-team remediation
   A structured rogue-agent exercise against v1.0.2 ("what would I do,
   as the adversary, with full knowledge of the detection logic?")
@@ -196,7 +251,7 @@ from urllib.parse import urlparse, unquote
 import httpx
 from pydantic import BaseModel, Field
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 DEFAULT_URL = os.environ.get("CORRAL_URL", "http://127.0.0.1:7331")
 CORRAL_API_KEY = os.environ.get("CORRAL_API_KEY", "")        # admin scope
 CORRAL_INGEST_KEY = os.environ.get("CORRAL_INGEST_KEY", "")  # agent scope
@@ -250,8 +305,11 @@ SESSION_CAP_WINDOW = float(os.environ.get("CORRAL_SESSION_CAP_WINDOW_S",
                                           "86400"))
 # v1.0.2: adoption + deception + budget controls
 LEARN_MODE = bool(os.environ.get("CORRAL_LEARN"))   # propose, don't quarantine
-CANARIES = [s.strip() for s in os.environ.get("CORRAL_CANARIES", "").split(",")
-            if s.strip()]
+# v1.0.4: CORRAL_CANARIES is read ONLY by the server at startup (see
+# create_app) and held in server-local state — never in a module
+# constant an agent process can import and enumerate (external review:
+# corral.CANARIES was readable in the agent process, so a rogue could
+# list the honeytokens and aim around them). Matching is server-side.
 EGRESS_BUDGET = int(os.environ.get("CORRAL_EGRESS_BUDGET_BYTES", "1048576"))
 EGRESS_BUDGET_WINDOW = float(os.environ.get("CORRAL_EGRESS_BUDGET_WINDOW_S",
                                             "600"))
@@ -380,6 +438,9 @@ class BlockIn(BaseModel):
     value: str
     reason: str = "defender action"
     ttl: Optional[float] = None   # None → BLOCK_TTL; <=0 → permanent
+    agent: str = ""   # v1.0.4: block scope — "" fleet-wide, otherwise
+                      # only that agent (denied attempts must not get a
+                      # service blocked for the whole fleet)
 
 class IncidentIn(BaseModel):
     incident_id: str
@@ -495,17 +556,27 @@ _URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://\S+$")
 _IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?(?:/\S*)?$")
 _PATH_RE = re.compile(r"^(?:/|~/|\./|\.\./)[\w.@+\-/]{1,300}$")
 
+_GENERIC_SEG = re.compile(r"^(?:v\d+(?:\.\d+)?|api|rest|svc)$", re.I)
+
 def _domain_coord(url: str) -> Optional[str]:
     """v1.0.2: coordination key for a URL — host + first path segment.
     Egress identity stays the bare host; coordination identity is the
     endpoint, so two agents on different paths of one internal API are
-    not a channel."""
+    not a channel.
+    v1.0.4: generic first segments (v1, v2, api, rest, svc) are NOT an
+    endpoint identity — /v1/metrics and /v1/docs shared the coord
+    'api.internal/v1' and two unrelated agents were quarantined as a
+    channel (external review). Generic segments extend the coord to
+    two segments."""
     if "://" not in url:
         return None
     u = urlparse(url)
     host = normalize_resource("domain", u.hostname or "")
-    seg = u.path.strip("/").split("/")[0] if u.path.strip("/") else ""
-    return f"{host}/{seg}" if host and seg else None
+    parts = [p for p in u.path.strip("/").split("/") if p]
+    if not host or not parts:
+        return None
+    take = 2 if len(parts) > 1 and _GENERIC_SEG.match(parts[0]) else 1
+    return host + "/" + "/".join(parts[:take])
 
 def _deep_scan_all(args: dict) -> list[Resource]:
     out = []
@@ -641,15 +712,27 @@ def extract_resource(tool: str, args: dict) -> Optional[Resource]:
     rs = extract_resources(tool, args)
     return rs[0] if rs else None
 
+def _benign_covers(v: str, start: int, end: int) -> bool:
+    """v1.0.4: is the sensitive MATCH itself inside a benign-token
+    occurrence? ('token' inside 'tokenizer' — yes; '.env' at the end of
+    '/app/environments/prod/.env' — no: 'environment' appears elsewhere
+    in the path and must not exempt it, external review.)"""
+    for b in _SENSITIVE_BENIGN:
+        pos = v.find(b)
+        while pos != -1:
+            if pos <= start and end <= pos + len(b):
+                return True
+            pos = v.find(b, pos + 1)
+    return False
+
 def _is_sensitive(value: str, patterns: list[str]) -> bool:
     v = value.lower()
-    if any(b in v for b in _SENSITIVE_BENIGN):
-        return False
     for p in patterns:
         # whole-token match: "token" hits api-token.json, not tokenizer
-        if re.search(r"(?<![a-z0-9])" + re.escape(p.lower())
-                     + r"(?![a-z0-9])", v):
-            return True
+        for m in re.finditer(r"(?<![a-z0-9])" + re.escape(p.lower())
+                             + r"(?![a-z0-9])", v):
+            if not _benign_covers(v, m.start(), m.end()):
+                return True
     return False
 
 def evaluate_policy(policy: AgentPolicy, tool: str, args: dict,
@@ -702,18 +785,7 @@ def evaluate_policy_all(policy: AgentPolicy, tool: str, args: dict,
 # ---- v1.0.2: content fingerprints (content-flow correlation) ---------
 # Cross-session channels survive renaming when the BYTES move intact:
 # hash what was written, hash what a read returned, flag the echo.
-def _shingles(text: str, n: int = 5, cap: int = 128) -> list[int]:
-    words = re.findall(r"[a-z0-9]+", text.lower())
-    if len(words) < n:
-        return []
-    out = set()
-    for i in range(len(words) - n + 1):
-        gram = " ".join(words[i:i + n]).encode()
-        out.add(int.from_bytes(hashlib.sha1(gram).digest()[:4], "big"))
-        if len(out) >= cap:
-            break
-    return sorted(out)
-
+# (_shingles lives below with the tunables — v1.0.4 added blob chunks)
 def _fingerprint(text: str) -> tuple[str, list[int]]:
     return hashlib.sha256(text.encode()).hexdigest(), _shingles(text)
 
@@ -723,8 +795,34 @@ def _fp_overlap(a: list[int], b: list[int]) -> float:
     inter = len(set(a) & set(b))
     return inter / max(1, min(len(a), len(b)))
 
-FP_MIN_CHARS = 64        # shorter payloads aren't worth fingerprinting
+FP_MIN_CHARS = int(os.environ.get("CORRAL_FP_MIN_CHARS", "32"))
 FP_OVERLAP = 0.6         # shingle containment ratio that flags an echo
+
+# v1.0.4: word 5-gram shingles cannot see a hex/base64 blob — the blob
+# is ONE giant token, no 5-word gram spans it, so a payload buried in a
+# larger document was invisible (external review). Long hex/base64 runs
+# are chunked into 16-char pieces, each hashed into the shingle set.
+_BLOB_RE = re.compile(r"[0-9a-fA-F]{16,}|[A-Za-z0-9+/]{24,}={0,2}")
+
+def _shingles(text: str, n: int = 5, cap: int = 128) -> list[int]:
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    out = set()
+    if len(words) >= n:
+        for i in range(len(words) - n + 1):
+            gram = " ".join(words[i:i + n]).encode()
+            out.add(int.from_bytes(hashlib.sha1(gram).digest()[:4],
+                                   "big"))
+            if len(out) >= cap:
+                break
+    for m in _BLOB_RE.finditer(text):
+        blob = m.group(0)
+        for i in range(0, len(blob) - 15, 16):
+            out.add(int.from_bytes(
+                hashlib.sha1(blob[i:i + 16].encode()).digest()[:4],
+                "big"))
+            if len(out) >= cap * 2:
+                return sorted(out)
+    return sorted(out)
 
 def redact(args: dict, patterns: list[str]) -> dict:
     out = {}
@@ -834,7 +932,7 @@ class CorralClient:
                 raise CorralUnavailable("collector unreachable at precheck")
         return False
 
-    def blocked(self, kind: str, value: str) -> bool:
+    def blocked(self, kind: str, value: str, agent: str = "") -> bool:
         ts, blocks = self._blocks
         now = time.time()
         if now - ts > BLOCK_CACHE_TTL and now - self._blocks_last_attempt > 1.0:
@@ -842,14 +940,16 @@ class CorralClient:
             try:                              # timestamp only advances
                 r = self._http.get("/blocks") # on success, so a collector
                 if r.status_code == 200:      # flap doesn't extend the
-                    blocks = {(b["kind"], b["value"])  # stale window
+                    blocks = {(b["kind"], b["value"],
+                               b.get("agent") or "")   # v1.0.4: scope
                               for b in r.json().get("blocks", [])}
                     self._blocks = (now, blocks)
             except Exception:
                 if self.fail_closed:
                     raise CorralUnavailable("collector unreachable at "
                                             "blocklist refresh")
-        return (kind, value) in blocks
+        return (kind, value, "") in blocks or \
+               (kind, value, agent) in blocks
 
     def fingerprint(self, session_id: str, agent_id: str, op: str,
                     value: str, sha: str, shingles: list,
@@ -1070,9 +1170,9 @@ class GuardedTool:
                         f"request to an allowed domain")
             if allowed:
                 for r in resources:
-                    if (a.client.blocked(r.kind.value, r.value)
-                            or (r.coord and a.client.blocked(r.kind.value,
-                                                             r.coord))):
+                    if (a.client.blocked(r.kind.value, r.value, a.agent_id)
+                            or (r.coord and a.client.blocked(
+                                r.kind.value, r.coord, a.agent_id))):
                         allowed, reason = False, (
                             f"{r.kind.value} '{r.coord or r.value}' is "
                             f"blocklisted")
@@ -1094,55 +1194,82 @@ class GuardedTool:
         self._fingerprint(call_args, resources, result)   # v1.0.2
         return result
 
+    @staticmethod
+    def _fp_text(v) -> Optional[str]:
+        """v1.0.4: coerce a value to fingerprintable text — bytes are
+        decoded (errors ignored), dicts/lists are canonically serialized
+        (external review: only str results were fingerprinted, so a
+        channel returning bytes or parsed JSON was invisible)."""
+        if isinstance(v, str):
+            return v
+        if isinstance(v, (bytes, bytearray)):
+            return bytes(v).decode("utf-8", "ignore")
+        if isinstance(v, (dict, list)):
+            try:
+                return json.dumps(v, sort_keys=True, default=str)
+            except Exception:
+                return None
+        return None
+
     def _fingerprint(self, call_args: dict, resources: list[Resource],
                      result) -> None:
         """v1.0.2: content-flow correlation. Writes register a content
         fingerprint AFTER successful execution (only real writes count);
         reads fingerprint what came back, and an echo of another agent's
-        write re-enters the normal event path as content_echo."""
-        op = self.op or op_of(self.name)
+        write re-enters the normal event path as content_echo.
+        v1.0.4: EVERY long string argument is fingerprinted, not just
+        the first (a payload in the second argument was invisible), and
+        the minimum length dropped to 32 (chunked channels under 64
+        chars were invisible)."""
+        op = self.op or op_of(
+            self.name, resources[0].kind.value if resources else None)
         a = self.agent
         try:
             if op == "write":
+                registered = 0
                 for v in call_args.values():
-                    if isinstance(v, str) and len(v) >= FP_MIN_CHARS:
-                        sha, sh = _fingerprint(v)
+                    text = self._fp_text(v)
+                    if text and len(text) >= FP_MIN_CHARS:
+                        sha, sh = _fingerprint(text)
                         a.client.fingerprint(
                             a.session_id, a.agent_id, "write",
                             (resources[0].coord or resources[0].value)
                             if resources else "", sha, sh,
                             kind=resources[0].kind.value
                             if resources else "")
-                        break
-            elif op == "read" and isinstance(result, str) \
-                    and len(result) >= FP_MIN_CHARS:
-                sha, sh = _fingerprint(result)
-                resp = a.client.fingerprint(
-                    a.session_id, a.agent_id, "read",
-                    (resources[0].coord or resources[0].value)
-                    if resources else "", sha, sh,
-                    kind=resources[0].kind.value if resources else "")
-                if resp and resp.get("echo"):
-                    # v1.0.3: carry the writer context so the defender
-                    # can respond against the PLANTER, not just the
-                    # reader — echo evidence is content-based and
-                    # resource-independent, so reader-only response is
-                    # aimable at innocents (self-red-team). The sha and
-                    # shingles let the server VERIFY the claim against
-                    # its fingerprint store, so a forged echo event
-                    # can't name arbitrary writers.
-                    writers = resp.get("writers") or []
-                    echo_args = dict(call_args)
-                    echo_args["__echo_writers"] = writers[:5]
-                    echo_args["__echo_sha"] = sha
-                    echo_args["__echo_shingles"] = sh
-                    who = ", ".join(f"{w.get('agent')} via "
-                                    f"{w.get('resource')}"
-                                    for w in writers[:3]) or "unknown"
-                    self._emit(echo_args, resources, Outcome.allowed,
-                               "read result echoes another agent's write "
-                               f"(content-flow match: {who})",
-                               extra=["content_echo"])
+                        registered += 1
+                        if registered >= 5:   # bound the per-call cost
+                            break
+            elif op == "read":
+                text = self._fp_text(result)
+                if text and len(text) >= FP_MIN_CHARS:
+                    sha, sh = _fingerprint(text)
+                    resp = a.client.fingerprint(
+                        a.session_id, a.agent_id, "read",
+                        (resources[0].coord or resources[0].value)
+                        if resources else "", sha, sh,
+                        kind=resources[0].kind.value if resources else "")
+                    if resp and resp.get("echo"):
+                        # v1.0.3: carry the writer context so the defender
+                        # can respond against the PLANTER, not just the
+                        # reader — echo evidence is content-based and
+                        # resource-independent, so reader-only response is
+                        # aimable at innocents (self-red-team). The sha and
+                        # shingles let the server VERIFY the claim against
+                        # its fingerprint store, so a forged echo event
+                        # can't name arbitrary writers.
+                        writers = resp.get("writers") or []
+                        echo_args = dict(call_args)
+                        echo_args["__echo_writers"] = writers[:5]
+                        echo_args["__echo_sha"] = sha
+                        echo_args["__echo_shingles"] = sh
+                        who = ", ".join(f"{w.get('agent')} via "
+                                        f"{w.get('resource')}"
+                                        for w in writers[:3]) or "unknown"
+                        self._emit(echo_args, resources, Outcome.allowed,
+                                   "read result echoes another agent's write "
+                                   f"(content-flow match: {who})",
+                                   extra=["content_echo"])
         except Exception:
             pass   # fingerprints are enrichment; never break the call
 
@@ -1162,12 +1289,9 @@ class GuardedTool:
                 break
         if _nested_url_hosts(call_args):
             hints.append("relay_laundering")   # v0.5.5
-        # v1.0.2: canary/honeytoken touch — near-zero false positives,
-        # catches channels nobody anticipated
-        for v in call_args.values():
-            if isinstance(v, str) and any(c in v for c in CANARIES):
-                hints.append("canary_touch")
-                break
+        # v1.0.4: no client-side canary check — the honeytoken list is
+        # server-local state now; the server derives canary_touch from
+        # resources and argument values on every event.
         ev = ToolCallEvent(
             session_id=a.session_id, agent_id=a.agent_id, tool=self.name,
             args=redact(call_args, a.policy.sensitive_patterns),
@@ -1293,13 +1417,18 @@ CREATE TABLE IF NOT EXISTS events(
   agent_id TEXT, tool TEXT, args TEXT, resource TEXT, outcome TEXT,
   reason TEXT, flags TEXT);
 CREATE INDEX IF NOT EXISTS idx_events_ingest ON events(ingest_ts);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
+CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_sessions_seen ON sessions(last_seen);
 CREATE TABLE IF NOT EXISTS resource_access(
   ts REAL, ingest_ts REAL, kind TEXT, value TEXT, session_id TEXT,
   agent_id TEXT, op TEXT, event_id TEXT, outcome TEXT);
 CREATE INDEX IF NOT EXISTS idx_ra ON resource_access(kind, value, ts);
 CREATE TABLE IF NOT EXISTS blocks(
-  kind TEXT, value TEXT, reason TEXT, ts REAL, expires REAL,
-  PRIMARY KEY(kind, value));
+  kind TEXT, value TEXT, agent TEXT NOT NULL DEFAULT '',
+  reason TEXT, ts REAL, expires REAL,
+  PRIMARY KEY(kind, value, agent));
 CREATE TABLE IF NOT EXISTS incidents(
   incident_id TEXT PRIMARY KEY, created REAL, started REAL,
   session_ids TEXT, event_ids TEXT, verdict TEXT, actions TEXT,
@@ -1333,6 +1462,18 @@ def _migrate(db: sqlite3.Connection):
         db.execute("ALTER TABLE sessions ADD COLUMN last_seen REAL")
         db.execute("UPDATE sessions SET last_seen = created "
                    "WHERE last_seen IS NULL")
+    # v1.0.4: scoped blocks — the blocks primary key gains an agent
+    # column ('' = fleet-wide). Rebuild the table; existing blocks
+    # become fleet-wide, which preserves their semantics.
+    if "agent" not in cols("blocks"):
+        db.execute("ALTER TABLE blocks RENAME TO blocks_old")
+        db.execute("CREATE TABLE blocks(kind TEXT, value TEXT, "
+                   "agent TEXT NOT NULL DEFAULT '', reason TEXT, "
+                   "ts REAL, expires REAL, "
+                   "PRIMARY KEY(kind, value, agent))")
+        db.execute("INSERT INTO blocks SELECT kind, value, '', reason, "
+                   "ts, expires FROM blocks_old")
+        db.execute("DROP TABLE blocks_old")
     db.commit()
 
 class Store:
@@ -1342,6 +1483,15 @@ class Store:
             os.makedirs(d, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        # v1.0.4: WAL + NORMAL sync + busy_timeout (external review —
+        # the 150-agent loadtest collapsed to 12 events/s on journal
+        # fsyncs and reader/writer serialization, and the defender's
+        # reads timed out behind the write lock). WAL lets readers run
+        # alongside the single writer; NORMAL sync makes a commit cheap
+        # enough for per-event ingest on one node.
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        self.db.execute("PRAGMA busy_timeout=10000")
         self.lock = threading.Lock()
         with self.lock:
             self.db.executescript(SCHEMA)
@@ -1445,6 +1595,9 @@ class Store:
         # bare host). content_scan resources (URLs inside prose) are
         # policy-checked but never graphed: citing the same docs is
         # not a channel.
+        # v1.0.4: the op is derived PER RESOURCE with kind-aware
+        # defaults — install_package on a package resource is a read,
+        # on a file it would be both (external review).
         rs = ev.resources or ([ev.resource] if ev.resource else [])
         rows, seen = [], set()
         for r in rs:
@@ -1454,8 +1607,9 @@ class Store:
             if (r.kind.value, gv) in seen:
                 continue
             seen.add((r.kind.value, gv))
+            row_op = ev.op or op_of(ev.tool, r.kind.value)
             rows.append((ev.ts, time.time(), r.kind.value, gv,
-                         ev.session_id, ev.agent_id, op, ev.event_id,
+                         ev.session_id, ev.agent_id, row_op, ev.event_id,
                          ev.outcome.value))
         if not rows:
             return
@@ -1486,33 +1640,48 @@ class Store:
         return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     def access_writes_children(self, kind: str, prefix: str, since: float,
-                               sep: str = "/", limit: int = 50):
+                               sep: str = "/", limit: int = 200,
+                               exclude_agent: Optional[str] = None):
         """v1.0.2: name-encoded channels — writes UNDER a prefix the
         reader enumerated (listed a directory, searched a registry
         prefix). The message lives in the child NAME; exact-match
-        correlation can't see it (external review)."""
+        correlation can't see it (external review).
+        v1.0.4: exclude the reader's OWN writes in SQL, order by
+        recency, and raise the limit (external review — a reader could
+        pad the prefix with 60 of its own junk writes and push the real
+        message past the old unordered LIMIT 50)."""
         esc = self._like_escape(prefix).rstrip("/")
         pat = esc + sep + "%" if sep else esc + "%"
+        q = ("SELECT * FROM resource_access WHERE kind=? "
+             "AND ingest_ts>? AND op IN ('write','access') "
+             "AND outcome='allowed' AND value LIKE ? ESCAPE '\\'")
+        params: list = [kind, since, pat]
+        if exclude_agent:
+            q += " AND agent_id != ?"
+            params.append(exclude_agent)
+        q += " ORDER BY ingest_ts DESC LIMIT ?"
+        params.append(limit)
         with self.lock:
-            rows = self.db.execute(
-                "SELECT * FROM resource_access WHERE kind=? "
-                "AND ingest_ts>? AND op IN ('write','access') "
-                "AND outcome='allowed' AND value LIKE ? ESCAPE '\\' "
-                "LIMIT ?", (kind, since, pat, limit)).fetchall()
+            rows = self.db.execute(q, params).fetchall()
         return [dict(r) for r in rows]
 
     def access_writes_dormant_children(self, kind: str, prefix: str,
                                        before: float, sep: str = "/",
-                                       limit: int = 50):
+                                       limit: int = 200,
+                                       exclude_agent: Optional[str] = None):
         esc = self._like_escape(prefix).rstrip("/")
         pat = esc + sep + "%" if sep else esc + "%"
+        q = ("SELECT * FROM resource_access WHERE kind=? "
+             "AND ingest_ts<=? AND op IN ('write','access') "
+             "AND outcome='allowed' AND value LIKE ? ESCAPE '\\'")
+        params: list = [kind, before, pat]
+        if exclude_agent:
+            q += " AND agent_id != ?"
+            params.append(exclude_agent)
+        q += " ORDER BY ingest_ts DESC LIMIT ?"
+        params.append(limit)
         with self.lock:
-            rows = self.db.execute(
-                "SELECT * FROM resource_access WHERE kind=? "
-                "AND ingest_ts<=? AND op IN ('write','access') "
-                "AND outcome='allowed' AND value LIKE ? ESCAPE '\\' "
-                "ORDER BY ingest_ts DESC LIMIT ?",
-                (kind, before, pat, limit)).fetchall()
+            rows = self.db.execute(q, params).fetchall()
         return [dict(r) for r in rows]
 
     def agent_event_stats(self, agent_id: str, before: float):
@@ -1578,26 +1747,40 @@ class Store:
         return [dict(r) for r in rows]
 
     # -- blocks (lifecycle) ----------------------------------------
-    def add_block(self, kind, value, reason, ttl=None):
+    def add_block(self, kind, value, reason, ttl=None, agent=""):
+        # v1.0.4: agent="" is fleet-wide; an agent-scoped block applies
+        # only to that agent (external review — a DENIED attempt must
+        # not get a service blocked for the whole fleet)
         expires = (time.time() + ttl) if ttl else None
         with self.lock:
-            self.db.execute("INSERT OR REPLACE INTO blocks VALUES(?,?,?,?,?)",
-                            (kind, value, reason, time.time(), expires))
+            self.db.execute(
+                "INSERT OR REPLACE INTO blocks VALUES(?,?,?,?,?,?)",
+                (kind, value, agent or "", reason, time.time(), expires))
             self.db.commit()
 
-    def remove_block(self, kind, value):
+    def remove_block(self, kind, value, agent=None):
+        # agent=None (operator unblock) clears EVERY scope for the
+        # resource; a scoped removal clears just that scope
         with self.lock:
-            self.db.execute("DELETE FROM blocks WHERE kind=? AND value=?",
-                            (kind, value))
+            if agent is None:
+                self.db.execute(
+                    "DELETE FROM blocks WHERE kind=? AND value=?",
+                    (kind, value))
+            else:
+                self.db.execute(
+                    "DELETE FROM blocks WHERE kind=? AND value=? "
+                    "AND agent=?", (kind, value, agent))
             self.db.commit()
 
-    def is_blocked(self, kind, value) -> bool:
+    def is_blocked(self, kind, value, agent="") -> bool:
         now = time.time()
         with self.lock:
-            row = self.db.execute(
-                "SELECT expires FROM blocks WHERE kind=? AND value=?",
-                (kind, value)).fetchone()
-        return bool(row and (row["expires"] is None or row["expires"] > now))
+            rows = self.db.execute(
+                "SELECT agent, expires FROM blocks WHERE kind=? AND "
+                "value=?", (kind, value)).fetchall()
+        return any((not r["agent"] or r["agent"] == agent)
+                   and (r["expires"] is None or r["expires"] > now)
+                   for r in rows)
 
     def blocks(self):
         now = time.time()
@@ -1673,6 +1856,14 @@ _READ = ("fetch", "read", "get", "load", "download", "view", "search",
          "lookup", "resolve")
 _CODE_EXEC = ("run_code", "exec", "eval", "shell", "bash", "python",
               "subprocess", "terminal", "command")
+# v1.0.4: kind-aware verb defaults (external review — two agents
+# INSTALLING the same package manufactured a channel under
+# unknown-verb-means-both; numpy vs numpy-financial flagged; pandas got
+# blocked for the fleet). Installing fetches FROM the registry — a
+# read. Only publishing-shaped verbs write TO it.
+_PKG_WRITE = ("publish", "upload", "push", "release", "yank")
+_PKG_READ = ("install", "add", "remove", "uninstall", "upgrade",
+             "update", "resolve", "require", "pin")
 _SUSPICIOUS_CONTENT = re.compile(
     r"(?i)(technique|exploit|instruction|coordinat|egress|exfiltrat|"
     r"secret|token|password|ssrf|lateral|bypass)")
@@ -1693,7 +1884,7 @@ def _matches(name: str, hints) -> bool:
 
 _VERB_SPLIT = re.compile(r"[^a-z]+")
 
-def op_of(tool: str) -> str:
+def op_of(tool: str, kind: Optional[str] = None) -> str:
     # v1.0.2: whole-WORD verb matching (external review). Substring
     # matching classified get_aSETs, read_SETtings, get_outPUT and
     # get_dataSET as writes — a covert read through get_dataset was
@@ -1701,7 +1892,19 @@ def op_of(tool: str) -> str:
     # with no recognizable verb is "access" — which the access graph
     # treats as BOTH read and write, so an unknown verb can't hide a
     # channel either.
+    # v1.0.4: kind-aware defaults (external review). For PACKAGE
+    # resources, installing is a registry READ and only publishing is a
+    # write — "install_package('pandas')" on two agents is two fetches,
+    # not a channel. The both-directions default stays for other kinds.
     words = {w for w in _VERB_SPLIT.split(tool.lower()) if w}
+    if kind == "package":
+        if words & set(_PKG_WRITE):
+            return "write"
+        if words & (set(_PKG_READ) | set(_READ)):
+            return "read"
+        if words & set(_WRITE):
+            return "write"      # create/post a package ≈ publishing
+        return "read"           # unknown verbs on packages: fetch-shaped
     if words & set(_WRITE):
         return "write"
     if words & set(_READ):
@@ -1723,6 +1926,11 @@ class AnomalyEngine:
         self._baseline_cache: dict[str, tuple] = {}   # v0.8
         self.fp_store = None   # v1.0.3: wired by create_app for echo
         #                        # hint verification
+        self.canaries: list = []   # v1.0.4: wired by create_app from the
+        #                          # SERVER's own env — the SDK never sees
+        #                          # the honeytoken list (external review:
+        #                          # corral.CANARIES was readable in the
+        #                          # agent process)
 
     def process(self, ev: ToolCallEvent, now: Optional[float] = None) -> list[str]:
         # v0.5.2: ALL detection windows run on the server clock (`now`).
@@ -1761,11 +1969,18 @@ class AnomalyEngine:
                 flags.append("credential_access")
             # v1.0.2: canary resource names — the operator plants
             # honeytoken files/queues/keys; touching one is near-zero FP
-            if CANARIES and any(any(c in x.value for c in CANARIES)
-                                for x in graphed):
-                flags.append("canary_touch")
+            # v1.0.4: matching is SERVER-side only, against resources
+            # AND argument values — the agent process never holds the
+            # canary list (external review: a rogue could enumerate the
+            # honeytokens from corral.CANARIES and aim around them)
+            if self.canaries:
+                hay = [x.value for x in graphed] + [
+                    str(v) for v in ev.args.values()
+                    if isinstance(v, str)]
+                if any(c in h for c in self.canaries for h in hay):
+                    flags.append("canary_touch")
             if (r and r.kind == ResourceKind.package
-                    and (ev.op or op_of(ev.tool)) == "write"
+                    and (ev.op or op_of(ev.tool, "package")) == "write"
                     and ("suspicious_content" in flags
                          or self._content_suspicious(ev)
                          or _NOTE_NAME.search(r.value))):
@@ -1835,7 +2050,7 @@ class AnomalyEngine:
                 rate = self._lifetime_rate(aid, now)
                 if rate is not None and len(vdq) > rate * BASELINE_FACTOR:
                     flags.append("baseline_deviation")
-            op = ev.op or op_of(ev.tool)
+            op = ev.op or op_of(ev.tool, r.kind.value if r else None)
             if r and op in ("read", "access"):
                 # v1.0.2: unknown-verb ("access") calls count as readers
                 # too — sync_*/get_dataset style names can't hide a read
@@ -1874,13 +2089,6 @@ class AnomalyEngine:
             elif f == "relay_laundering":
                 # verifiable: nested URLs must be present in the args
                 if _nested_url_hosts(ev.args):
-                    out.append(f)
-            elif f == "canary_touch" and CANARIES:
-                rs = ev.resources or ([ev.resource] if ev.resource
-                                      else [])
-                hay = [str(v) for v in ev.args.values()] + \
-                      [r.value for r in rs if r]
-                if any(c in h for c in CANARIES for h in hay):
                     out.append(f)
             elif f == "content_echo":
                 writers = self._verified_echo_writers(ev)
@@ -1925,22 +2133,29 @@ class AnomalyEngine:
             # child NAME, read by listing the parent (external review:
             # "after the remediation the agents rebuilt the board in
             # directory names"). A read of a parent prefix correlates
-            # with writes underneath it.
+            # with writes underneath it. v1.0.4: the children query
+            # excludes the reader's own padding writes in SQL.
             if r.kind.value in ("file", "index", "log", "queue"):
                 rows += self.store.access_writes_children(
-                    r.kind.value, gv, now - COORD_WINDOW)
+                    r.kind.value, gv, now - COORD_WINDOW,
+                    exclude_agent=ev.agent_id)
             elif r.kind.value == "package" and len(gv) >= 4:
                 rows += self.store.access_writes_children(
-                    r.kind.value, gv, now - COORD_WINDOW, sep="")
+                    r.kind.value, gv, now - COORD_WINDOW, sep="",
+                    exclude_agent=ev.agent_id)
             elif r.kind.value == "domain" and r.coord is None:
                 # v1.0.3: a bare-host read (GET /, a root listing) is the
                 # enumeration pattern one layer up — the message lives in
-                # endpoint NAMES under the host (self-red-team). Correlate
-                # with writes to any endpoint beneath it. Endpoint-scoped
-                # reads keep their v1.0.2 coord identity (shared-host
-                # false positives stay closed).
-                rows += self.store.access_writes_children(
-                    r.kind.value, gv, now - COORD_WINDOW, sep="/")
+                # endpoint NAMES under the host (self-red-team).
+                # v1.0.4: require an actual LISTING signal — writes to
+                # ≥2 DISTINCT endpoints by other agents (external review:
+                # check_health(host=...) / GET / against a host with one
+                # written endpoint is not a channel).
+                kids = self.store.access_writes_children(
+                    r.kind.value, gv, now - COORD_WINDOW, sep="/",
+                    exclude_agent=ev.agent_id)
+                if len({k["value"] for k in kids}) >= 2:
+                    rows += kids
             # the principal is the AGENT: my own earlier sessions' writes
             # are my checkpoint, not coordination
             return {row["agent_id"] for row in rows
@@ -1956,13 +2171,18 @@ class AnomalyEngine:
                                                     now - COORD_WINDOW)
             if r.kind.value in ("file", "index", "log", "queue"):
                 rows += self.store.access_writes_dormant_children(
-                    r.kind.value, gv, now - COORD_WINDOW)
+                    r.kind.value, gv, now - COORD_WINDOW,
+                    exclude_agent=ev.agent_id)
             elif r.kind.value == "package" and len(gv) >= 4:
                 rows += self.store.access_writes_dormant_children(
-                    r.kind.value, gv, now - COORD_WINDOW, sep="")
+                    r.kind.value, gv, now - COORD_WINDOW, sep="",
+                    exclude_agent=ev.agent_id)
             elif r.kind.value == "domain" and r.coord is None:
-                rows += self.store.access_writes_dormant_children(
-                    r.kind.value, gv, now - COORD_WINDOW, sep="/")
+                kids = self.store.access_writes_dormant_children(
+                    r.kind.value, gv, now - COORD_WINDOW, sep="/",
+                    exclude_agent=ev.agent_id)
+                if len({k["value"] for k in kids}) >= 2:
+                    rows += kids
             return {row["agent_id"] for row in rows
                     if row["agent_id"] != ev.agent_id}
         except Exception:
@@ -2046,6 +2266,14 @@ def create_app(db_path: str = "corral.db"):
     # v1.0.3: the engine verifies content_echo hints against the
     # fingerprint store — forged echoes can't name arbitrary writers
     app.state.anomaly.fp_store = app.state.fp
+    # v1.0.4: canaries are read from the SERVER's own environment into
+    # server-local state (external review — a module-level constant is
+    # importable from any agent process that loads corral.py, which let
+    # a rogue enumerate the honeytokens). Agent hosts should NOT have
+    # CORRAL_CANARIES in their environment; matching is server-side.
+    app.state.anomaly.canaries = [
+        s.strip() for s in
+        os.environ.get("CORRAL_CANARIES", "").split(",") if s.strip()]
 
     # v0.5 scoped auth:
     #   CORRAL_API_KEY    → admin: forensic reads + all admin mutations
@@ -2054,10 +2282,14 @@ def create_app(db_path: str = "corral.db"):
     # resources, resume sessions, rewrite CommPolicy, or read forensics.
     # v1.0.2: constant-time comparison (external review — timing oracle).
     def _admin_ok(req: Request) -> bool:
-        if not CORRAL_API_KEY:
-            return True
-        return hmac.compare_digest(
-            req.headers.get("x-corral-key", ""), CORRAL_API_KEY)
+        if CORRAL_API_KEY:
+            return hmac.compare_digest(
+                req.headers.get("x-corral-key", ""), CORRAL_API_KEY)
+        # v1.0.4: when the operator set ONLY the ingest key, the admin
+        # surface fails CLOSED (external review — with just
+        # CORRAL_INGEST_KEY set, an unauthenticated POST /comm_policy
+        # returned 200). Open admin exists only in no-keys demo mode.
+        return not CORRAL_INGEST_KEY
 
     def _ingest_ok(req: Request) -> bool:
         if not CORRAL_INGEST_KEY:
@@ -2305,8 +2537,9 @@ def create_app(db_path: str = "corral.db"):
         deny, deny_reason = False, ""
         rs_check = ev.resources or ([ev.resource] if ev.resource else [])
         for r in rs_check:
-            if store.is_blocked(r.kind.value, r.value) or \
-                    (r.coord and store.is_blocked(r.kind.value, r.coord)):
+            if store.is_blocked(r.kind.value, r.value, ev.agent_id) or \
+                    (r.coord and store.is_blocked(r.kind.value, r.coord,
+                                                  ev.agent_id)):
                 deny = True
                 deny_reason = (f"{r.kind.value} "
                                f"'{r.coord or r.value}' is blocklisted")
@@ -2412,9 +2645,33 @@ def create_app(db_path: str = "corral.db"):
     # quarantine into a proposal; the operator reviews and promotes
     # links into policy. Proposals are admin-only: an agent must never
     # learn what the defender is learning about it.
+    # v1.0.4: POST is admin-only too (external review — it was
+    # ingest-scope, so any agent could flood 2,000 junk proposals and
+    # crowd real ones out of the bounded store) and validated (a
+    # wildcard writer/reader/resource would list as a sanction-
+    # everything link).
+    _PROP_AGENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_*?.\-]{0,127}$")
+    _PROP_KINDS = ("file", "domain", "package", "env", "db", "api",
+                   "queue", "key", "git", "index", "log", "job")
+
+    def _proposal_valid(p: LearnProposalIn) -> bool:
+        if not (_PROP_AGENT.match(p.writer or "")
+                and _PROP_AGENT.match(p.reader or "")):
+            return False
+        if p.writer == "*" or p.reader == "*":
+            return False
+        kind, sep, pat = (p.resource or "").partition(":")
+        if not sep or kind not in _PROP_KINDS:
+            return False
+        if not pat or pat == "*" or len(pat) > 256:
+            return False
+        return all(c.isprintable() for c in p.resource)
+
     @app.post("/comm_policy/proposals")
     def add_proposal(p: LearnProposalIn, request: Request):
-        require_ingest(request)
+        require_admin(request)   # the DEFENDER files proposals; agents
+        if not _proposal_valid(p):            # never reach this store
+            raise HTTPException(422, "invalid proposal")
         key = (p.writer, p.reader, p.resource)
         pr = app.state.proposals.get(key)
         now = time.time()
@@ -2450,7 +2707,7 @@ def create_app(db_path: str = "corral.db"):
             ttl = None
         # v0.5.2: normalize so ./x, a/../x, trailing-dot FQDNs can't slip
         app.state.store.add_block(b.kind, normalize_resource(b.kind, b.value),
-                                  b.reason, ttl)
+                                  b.reason, ttl, agent=b.agent)
         return {"ok": True}
 
     @app.delete("/blocks")
@@ -2754,15 +3011,30 @@ def execute_playbook(verdict: Verdict, session_ids: list[str],
                 # api.example.com over one channel is the blast-radius
                 # outage the external review warned about
                 bv = r.get("coord") or r["value"]
-                if (r["kind"], bv) not in seen:
-                    seen.add((r["kind"], bv))
+                # v1.0.4: only FLEET-block a resource the agent
+                # SUCCESSFULLY used (outcome allowed). A denied attempt
+                # never touched the service — fleet-blocking it
+                # punishes every innocent agent for an attempt that
+                # never happened (external review: three denied calls
+                # to api.internal/v1/health got the endpoint blocked
+                # fleet-wide). Denied attempts earn an AGENT-scoped
+                # block: the rogue's other sessions stay out, the
+                # fleet keeps working.
+                scope = "" if e.get("outcome") == "allowed" \
+                    else (e.get("agent_id") or "")
+                if (r["kind"], bv, scope) not in seen:
+                    seen.add((r["kind"], bv, scope))
                     client._try("POST", "/blocks",
                                 json={"kind": r["kind"], "value": bv,
+                                      "agent": scope,
                                       "reason": f"playbook:{verdict.playbook}",
                                       "ttl": BLOCK_TTL})
                     executed.append({"type": "block_resource", "tier": 1,
                                      "resource": r,
-                                     "detail": "resource blocked"})
+                                     "detail": "resource blocked"
+                                               + ("" if not scope else
+                                                  f" (agent-scoped: "
+                                                  f"{scope})")})
             # v1.0.3: content_echo — also block the verified writer
             # resources (the planter's side of the renamed channel)
             if verdict.playbook == "content_echo":
@@ -3213,10 +3485,19 @@ def _run_approved_pending(client: CorralClient):
     except Exception:
         pass
 
+DEFENDER_TIMEOUT = float(os.environ.get("CORRAL_DEFENDER_TIMEOUT", "30"))
+
 def run_defender(base_url: Optional[str] = None, use_llm: bool = True,
                  interval: float = 0.5, once: bool = False, llm=None,
                  lookback: float = 5.0):
-    client = CorralClient(base_url)
+    # v1.0.4: a saturated collector must never kill the defense loop
+    # (external review — at 150 agents the /events read timed out, each
+    # timeout burned a poll cycle in a traceback, and the rogue pair
+    # walked while the defender thrashed). The defender gets a long
+    # read timeout, per-page fault isolation, and a quiet backoff; the
+    # watermark only advances on a successful page, so no flagged event
+    # is skipped by a timeout.
+    client = CorralClient(base_url, timeout=DEFENDER_TIMEOUT)
     llm = llm if llm is not None else (
         LLM() if use_llm and _llm_available() else None)
     if llm is not None:
@@ -3225,12 +3506,21 @@ def run_defender(base_url: Optional[str] = None, use_llm: bool = True,
     else:
         print("[defender] running — deterministic fallback")
     since = time.time() - lookback
+    failures = 0
     while True:
         try:
             while True:  # drain pages; never advance past a backlog
-                r = client._http.get("/events",
-                                     params={"flagged": "true",
-                                             "since": since, "limit": 100})
+                try:
+                    r = client._http.get("/events",
+                                         params={"flagged": "true",
+                                                 "since": since,
+                                                 "limit": 100})
+                except Exception as e:
+                    failures += 1
+                    print(f"[defender] collector read failed "
+                          f"({type(e).__name__}); backing off "
+                          f"(watermark held)", file=sys.stderr)
+                    break
                 if r.status_code != 200:
                     break
                 body = r.json()
@@ -3257,12 +3547,14 @@ def run_defender(base_url: Optional[str] = None, use_llm: bool = True,
                 if page_len < 100:
                     break
             _run_approved_pending(client)
-        except Exception:
-            import traceback
-            traceback.print_exc()
+            failures = 0
+        except Exception as e:
+            failures += 1
+            print(f"[defender] poll cycle failed ({type(e).__name__}: "
+                  f"{e}); continuing", file=sys.stderr)
         if once:
             return
-        time.sleep(interval)
+        time.sleep(min(interval * max(1, failures), 10.0))
 
 # ═════════════════════════ §6 DEMO ═════════════════════════
 
@@ -3541,7 +3833,11 @@ def selftest() -> int:
     os.makedirs(OUT_DIR, exist_ok=True)
     if os.path.exists(db):
         os.remove(db)
+    # v1.0.4: canaries are server-local state read from the SERVER's env
+    # at startup — plant the selftest honeytoken before the server boots
+    os.environ["CORRAL_CANARIES"] = "st-honey-9x"
     _, base = _start_server_thread(db, port=7332)
+    os.environ.pop("CORRAL_CANARIES", None)   # the server holds its copy
 
     pol_a = AgentPolicy(agent_id="st-a",
                         allowed_tools=["bench", "fetch", "publish",
@@ -4697,23 +4993,21 @@ def selftest() -> int:
     check("unknown-verb write + read still correlates (access = both)",
           any("unsanctioned_comm" in e["flags"] for e in unk),
           f"flags: {[e['flags'] for e in unk]}")
-    # (h) canary/honeytoken touch — near-zero-FP tripwire
-    saved_canaries = mod.CANARIES
-    mod.CANARIES = ["st-honey-9x"]
-    try:
-        ghc = GuardedAgent("st-canary", _file_pol("st-canary"),
-                           client=CorralClient(base))
-        ghc.tool(lambda path: "x", name="read_file")(
-            path="shared/st-honey-9x-creds.txt")
-        time.sleep(0.3)
-        hc = httpx.get(f"{base}/events",
-                       params={"session": ghc.session_id},
-                       timeout=5).json()["events"]
-        check("canary touch flagged on honeytoken resource",
-              any("canary_touch" in e["flags"] for e in hc),
-              f"flags: {[e['flags'] for e in hc]}")
-    finally:
-        mod.CANARIES = saved_canaries
+    # (h) canary/honeytoken touch — near-zero-FP tripwire. v1.0.4: the
+    # list is server-local (planted via CORRAL_CANARIES before the
+    # server booted above); the SDK never sees it.
+    assert not hasattr(mod, "CANARIES"), "canary list leaked to module scope"
+    ghc = GuardedAgent("st-canary", _file_pol("st-canary"),
+                       client=CorralClient(base))
+    ghc.tool(lambda path: "x", name="read_file")(
+        path="shared/st-honey-9x-creds.txt")
+    time.sleep(0.3)
+    hc = httpx.get(f"{base}/events",
+                   params={"session": ghc.session_id},
+                   timeout=5).json()["events"]
+    check("canary touch flagged on honeytoken resource (server-side)",
+          any("canary_touch" in e["flags"] for e in hc),
+          f"flags: {[e['flags'] for e in hc]}")
     # (i) content-flow fingerprints: rename the channel all you like —
     # the BYTES correlate. Same-agent read-back is clean.
     para = ("quarterly planning notes covering migration sequence "
@@ -5072,12 +5366,16 @@ def selftest() -> int:
               f"flags: {[e['flags'] for e in tev]}")
     finally:
         mod.EGRESS_BUDGET, mod.EGRESS_BUDGET_TOTAL = saved_tb
-    # (h) bare-host listing correlation: message smuggled in endpoint
-    # NAMES, read via the host root
+    # (h) bare-host listing correlation: messages smuggled in endpoint
+    # NAMES, read via the host root. v1.0.4: the listing signal requires
+    # ≥2 DISTINCT written endpoints (a health check against a host with
+    # one written endpoint is not a channel).
     glw4 = GuardedAgent("st-dom-w", _msg_pol("st-dom-w"),
                         client=CorralClient(base))
     glw4.tool(lambda url, body: "ok", name="post_message")(
         url="https://api.internal/stlist-m1/msg", body="x")
+    glw4.tool(lambda url, body: "ok", name="post_message")(
+        url="https://api.internal/stlist-m2/msg", body="y")
     glr4 = GuardedAgent("st-dom-r", _msg_pol("st-dom-r"),
                         client=CorralClient(base))
     glr4.tool(lambda url: "x", name="get_message")(
@@ -5088,6 +5386,26 @@ def selftest() -> int:
     check("bare-host listing correlates writes to endpoint names",
           any("unsanctioned_comm" in e["flags"] for e in dle),
           f"flags: {[e['flags'] for e in dle]}")
+    # negative: ONE written endpoint + a bare-host read is a health
+    # check, not a listing — no flag (v1.0.4 false-positive fix)
+    _pol2 = lambda aid: AgentPolicy(
+        agent_id=aid, allowed_tools=["post_message", "check_health"],
+        allowed_domains=["api2.internal"])
+    glw5 = GuardedAgent("st-dom-w1", _pol2("st-dom-w1"),
+                        client=CorralClient(base))
+    glw5.tool(lambda url, body: "ok", name="post_message")(
+        url="https://api2.internal/single-ep/msg", body="x")
+    glr5 = GuardedAgent("st-dom-r1", _pol2("st-dom-r1"),
+                        client=CorralClient(base))
+    glr5.tool(lambda url: "x", name="check_health")(
+        url="https://api2.internal")     # bare host, single endpoint
+    time.sleep(0.3)
+    dle1 = httpx.get(f"{base}/events",
+                     params={"session": glr5.session_id},
+                     timeout=5).json()["events"]
+    check("bare-host read over a single endpoint stays clean",
+          not any("unsanctioned_comm" in e["flags"] for e in dle1),
+          f"flags: {[e['flags'] for e in dle1]}")
     # (i) registration abuse on isolated apps: per-IP rate, windowed
     # fleet cap (history doesn't permanently exhaust it), proposals cap
     saved_reg = (mod.REG_IP_RATE, mod.MAX_SESSIONS,
@@ -5135,6 +5453,303 @@ def selftest() -> int:
         (mod.REG_IP_RATE, mod.MAX_SESSIONS,
          mod.SESSION_CAP_WINDOW, mod.PROPOSALS_MAX) = saved_reg
 
+    print("--- v1.0.4 external-review round 2 ---")
+    # (a) kind-aware verbs: two agents INSTALLING one package is two
+    # registry reads, not a channel — and near-prefix package names
+    # (numpy vs numpy-financial) don't manufacture one either
+    pol_inst = lambda aid: AgentPolicy(
+        agent_id=aid, allowed_tools=["install_package"],
+        allowed_domains=[])
+    gi1 = GuardedAgent("st-inst-1", pol_inst("st-inst-1"),
+                       client=CorralClient(base))
+    gi1.tool(lambda name: "installed", name="install_package")(
+        name="stpandas")
+    gi2 = GuardedAgent("st-inst-2", pol_inst("st-inst-2"),
+                       client=CorralClient(base))
+    gi2.tool(lambda name: "installed", name="install_package")(
+        name="stpandas")
+    gi3 = GuardedAgent("st-inst-3", pol_inst("st-inst-3"),
+                       client=CorralClient(base))
+    gi3.tool(lambda name: "installed", name="install_package")(
+        name="stpandas-financial")
+    time.sleep(0.3)
+    inst = [httpx.get(f"{base}/events", params={"session": g.session_id},
+                      timeout=5).json()["events"]
+            for g in (gi1, gi2, gi3)]
+    check("kind-aware verbs: package installs are reads, no phantom "
+          "channel", all(not any("unsanctioned_comm" in e["flags"]
+                                 for e in evs) for evs in inst),
+          f"flags: {[[e['flags'] for e in evs] for evs in inst]}")
+    # (b) versioned APIs: /v1/metrics and /v1/docs are DIFFERENT
+    # endpoints — generic first segments (v1, api, ...) extend the
+    # coordination identity to two segments
+    pol_v = lambda aid: AgentPolicy(
+        agent_id=aid, allowed_tools=["post_message", "get_message"],
+        allowed_domains=["api3.internal"])
+    gvw = GuardedAgent("st-ver-w", pol_v("st-ver-w"),
+                       client=CorralClient(base))
+    gvw.tool(lambda url, body: "ok", name="post_message")(
+        url="https://api3.internal/v1/metrics/cpu", body="1")
+    gvr1 = GuardedAgent("st-ver-r1", pol_v("st-ver-r1"),
+                        client=CorralClient(base))
+    gvr1.tool(lambda url: "x", name="get_message")(
+        url="https://api3.internal/v1/docs/intro")   # different endpoint
+    gvr2 = GuardedAgent("st-ver-r2", pol_v("st-ver-r2"),
+                        client=CorralClient(base))
+    gvr2.tool(lambda url: "x", name="get_message")(
+        url="https://api3.internal/v1/metrics/cpu")  # same endpoint
+    time.sleep(0.3)
+    ve1 = httpx.get(f"{base}/events", params={"session": gvr1.session_id},
+                    timeout=5).json()["events"]
+    ve2 = httpx.get(f"{base}/events", params={"session": gvr2.session_id},
+                    timeout=5).json()["events"]
+    check("versioned API: /v1/docs reader is clean, /v1/metrics reader "
+          "flags", not any("unsanctioned_comm" in e["flags"] for e in ve1)
+          and any("unsanctioned_comm" in e["flags"] for e in ve2),
+          f"docs={[e['flags'] for e in ve1]} "
+          f"metrics={[e['flags'] for e in ve2]}")
+    # (c) denied attempts never fleet-block: 3 denied egress calls earn
+    # the rogue an AGENT-scoped block; the service stays reachable for
+    # a legitimate agent
+    gden = GuardedAgent(
+        "st-deny", AgentPolicy(agent_id="st-deny",
+                               allowed_tools=["http_get"],
+                               allowed_domains=["registry.internal"]),
+        client=CorralClient(base))
+    for _ in range(3):
+        try:
+            gden.tool(lambda url: "ok", name="http_get")(
+                url="https://api4.internal/v1/health")
+        except PolicyBlocked:
+            pass
+    time.sleep(0.3)
+    run_defender(base, use_llm=False, once=True, lookback=300.0)
+    dblocks = httpx.get(f"{base}/blocks", timeout=5).json()["blocks"]
+    scoped = [b for b in dblocks
+              if b["value"] == "api4.internal/v1/health"]
+    check("denied egress: block is agent-scoped, not fleet-wide",
+          bool(scoped) and all(b.get("agent") == "st-deny"
+                               for b in scoped),
+          f"blocks: {[(b['value'], b.get('agent')) for b in scoped]}")
+    gok = GuardedAgent(
+        "st-legit-api4", AgentPolicy(agent_id="st-legit-api4",
+                                     allowed_tools=["http_get"],
+                                     allowed_domains=["api4.internal"]),
+        client=CorralClient(base))
+    try:
+        gok.tool(lambda url: "200 OK", name="http_get")(
+            url="https://api4.internal/v1/health")
+        check("denied egress: legitimate agent still reaches the "
+              "service", True)
+    except PolicyBlocked as e:
+        check("denied egress: legitimate agent still reaches the "
+              "service", False, str(e))
+    # (d) a SUCCESSFUL channel is still fleet-blocked (scope only
+    # softens denied-attempt responses)
+    gfw4 = GuardedAgent("st-fl-w", _file_pol("st-fl-w"),
+                        client=CorralClient(base))
+    gfw4.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/fleet-ch.md", content="rendezvous at dawn")
+    gfr4 = GuardedAgent("st-fl-r", _file_pol("st-fl-r"),
+                        client=CorralClient(base))
+    gfr4.tool(lambda path: "x", name="read_file")(
+        path="shared/fleet-ch.md")
+    time.sleep(0.3)
+    run_defender(base, use_llm=False, once=True, lookback=300.0)
+    fblocks = httpx.get(f"{base}/blocks", timeout=5).json()["blocks"]
+    flt = [(b["value"], b.get("agent")) for b in fblocks
+           if "fleet" in b["value"]]
+    check("successful channel: block stays fleet-wide",
+          any(b["value"] == "shared/fleet-ch.md" and not b.get("agent")
+              for b in fblocks),
+          f"blocks: {flt}")
+    gf3rd = GuardedAgent("st-fl-3", _file_pol("st-fl-3"),
+                         client=CorralClient(base))
+    try:
+        gf3rd.tool(lambda path: "x", name="read_file")(
+            path="shared/fleet-ch.md")
+        check("fleet-wide block binds a third, untouched agent", False,
+              "call executed")
+    except PolicyBlocked:
+        check("fleet-wide block binds a third, untouched agent", True)
+    # (e) benign list is token-scoped: a benign substring elsewhere in
+    # the path no longer exempts a sensitive token
+    gben = GuardedAgent("st-ben", _file_pol("st-ben"),
+                        client=CorralClient(base))
+    for bad in ("/app/environments/prod/.env",
+                "/data/tokenizer_cache/credentials.json"):
+        try:
+            gben.tool(lambda path: "x", name="read_file")(path=bad)
+        except PolicyBlocked:
+            pass
+    gben.tool(lambda path: "x", name="read_file")(
+        path="shared/tokenizer.json")     # genuinely benign — clean
+    time.sleep(0.3)
+    ben = httpx.get(f"{base}/events", params={"session": gben.session_id},
+                    timeout=5).json()["events"]
+    # note: sensitive paths are REDACTED in args by the SDK — key on the
+    # resource value, which is never redacted
+    by_path = {(e.get("resource") or {}).get("value"): e["flags"]
+               for e in ben}
+    check("benign exemption is token-scoped: hidden .env + credentials "
+          "flag, tokenizer.json clean",
+          "credential_access" in by_path.get(
+              "/app/environments/prod/.env", [])
+          and "credential_access" in by_path.get(
+              "/data/tokenizer_cache/credentials.json", [])
+          and "credential_access" not in by_path.get(
+              "shared/tokenizer.json", ["?"]),
+          f"paths: {by_path}")
+    # (f) fingerprint coverage round 2: dict results, second long
+    # argument, 32-64 char chunks, hex blob buried in a document
+    para_b = ("vendor shortlist covering logistics pricing warehouse "
+              "sla terms penalties renewal windows and escalation "
+              "contacts for the northern region distribution contract")
+    gcv = GuardedAgent("st-cov-w", _file_pol("st-cov-w"),
+                       client=CorralClient(base))
+    gcv.tool(lambda path, content, notes: "ok", name="write_file")(
+        path="shared/cov-src.md", content=para_b, notes=para_b + " rev2")
+    gcv.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/cov-chunk.md",
+        content="the launch code is tango seven four niner")  # 43 chars
+    blob = "a1b2c3d4e5f60718" * 4       # 64-char hex payload, written pure
+    gcv.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/cov-blob.md", content=blob)
+    gcr5 = GuardedAgent("st-cov-r", _file_pol("st-cov-r"),
+                        client=CorralClient(base))
+    gcr5.tool(lambda path: {"body": para_b}, name="read_file")(
+        path="shared/cov-dict.md")                 # dict result
+    gcr5.tool(lambda path: para_b + " rev2", name="read_file")(
+        path="shared/cov-second.md")               # second arg's bytes
+    gcr5.tool(lambda path: "the launch code is tango seven four niner",
+              name="read_file")(path="shared/cov-chunk-copy.md")
+    gcr5.tool(lambda path: "incident report cover page " + blob +
+                           " — forwarded from the vendor portal",
+              name="read_file")(path="shared/cov-blob-doc.md")
+    time.sleep(0.4)
+    cov = httpx.get(f"{base}/events", params={"session": gcr5.session_id},
+                    timeout=5).json()["events"]
+    cov_by_path = {}
+    for e in cov:
+        cov_by_path.setdefault(e["args"].get("path"), set()).update(
+            e["flags"])
+    check("fingerprint: dict result echoes (canonical serialization)",
+          "content_echo" in cov_by_path.get("shared/cov-dict.md", set()),
+          f"flags: {cov_by_path.get('shared/cov-dict.md')}")
+    check("fingerprint: payload in the second long argument echoes",
+          "content_echo" in cov_by_path.get("shared/cov-second.md",
+                                            set()),
+          f"flags: {cov_by_path.get('shared/cov-second.md')}")
+    check("fingerprint: 32-64 char chunk echoes",
+          "content_echo" in cov_by_path.get("shared/cov-chunk-copy.md",
+                                            set()),
+          f"flags: {cov_by_path.get('shared/cov-chunk-copy.md')}")
+    check("fingerprint: hex payload buried in a larger document echoes",
+          "content_echo" in cov_by_path.get("shared/cov-blob-doc.md",
+                                            set()),
+          f"flags: {cov_by_path.get('shared/cov-blob-doc.md')}")
+    # (g) prefix padding: the reader's own junk writes can no longer
+    # push the real message out of the children query
+    gpw5 = GuardedAgent("st-pad-w", _file_pol("st-pad-w"),
+                        client=CorralClient(base))
+    gpw5.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/pad-reg/the-real-message", content="x")
+    gpr5 = GuardedAgent("st-pad-r", _file_pol("st-pad-r"),
+                        client=CorralClient(base))
+    pad = gpr5.tool(lambda path, content: "ok", name="write_file")
+    for i in range(60):          # pad the prefix with its OWN writes
+        pad(path=f"shared/pad-reg/junk-{i:02d}", content="noise")
+    gpr5.tool(lambda path: ["the-real-message"], name="read_file")(
+        path="shared/pad-reg")
+    time.sleep(0.3)
+    padev = httpx.get(f"{base}/events",
+                      params={"session": gpr5.session_id},
+                      timeout=5).json()["events"]
+    check("prefix padding: reader's own junk writes no longer hide the "
+          "channel", any("unsanctioned_comm" in e["flags"]
+                         for e in padev),
+          f"flags: {[e['flags'] for e in padev]}")
+    # (h) auth: with ONLY the ingest key set, the admin surface fails
+    # closed; proposals are admin-only and validated
+    saved_auth = (mod.CORRAL_API_KEY, mod.CORRAL_INGEST_KEY,
+                  mod.AGENT_KEYS)
+    try:
+        mod.CORRAL_API_KEY = ""
+        mod.CORRAL_INGEST_KEY = "ik-round2"
+        mod.AGENT_KEYS = []
+        tc_a = TestClient(create_app(os.path.join(OUT_DIR,
+                                                  "selftest-ingest.db")))
+        r1 = tc_a.post("/comm_policy", json={"links": [], "default":
+                                             "flag"})
+        r2 = tc_a.post("/comm_policy",
+                       headers={"X-Corral-Ingest-Key": "ik-round2"},
+                       json={"links": [], "default": "flag"})
+        r3 = tc_a.post("/comm_policy/proposals",
+                       headers={"X-Corral-Ingest-Key": "ik-round2"},
+                       json={"writer": "w", "reader": "r",
+                             "resource": "file:x"})
+        r4 = tc_a.post("/sessions",
+                       headers={"X-Corral-Ingest-Key": "ik-round2"},
+                       json={"session_id": "ing-ok",
+                             "agent_id": "ing-ok"})
+        check("ingest-only deployment: admin surface fails closed",
+              r1.status_code == 401 and r2.status_code == 401
+              and r3.status_code == 401 and r4.status_code == 200,
+              f"codes: {r1.status_code}/{r2.status_code}/"
+              f"{r3.status_code}/{r4.status_code}")
+        mod.CORRAL_INGEST_KEY = ""   # open demo app for validation test
+        tc_o = TestClient(create_app(os.path.join(OUT_DIR,
+                                                  "selftest-propval.db")))
+        r5 = tc_o.post("/comm_policy/proposals",
+                       json={"writer": "*", "reader": "r",
+                             "resource": "file:x"})
+        r6 = tc_o.post("/comm_policy/proposals",
+                       json={"writer": "orchestrator-*",
+                             "reader": "worker-1",
+                             "resource": "queue:tasks-*"})
+        check("proposals validated: wildcard rejected, real link filed",
+              r5.status_code == 422 and r6.status_code == 200,
+              f"codes: {r5.status_code}/{r6.status_code}")
+    finally:
+        (mod.CORRAL_API_KEY, mod.CORRAL_INGEST_KEY,
+         mod.AGENT_KEYS) = saved_auth
+    # (i) identity is required: the CLI server refuses to run without
+    # CORRAL_AGENT_KEYS unless open identity is explicit
+    import subprocess as _sp
+    clean_env = {k: v for k, v in os.environ.items()
+                 if not k.startswith("CORRAL_")}
+    r = _sp.run([sys.executable, os.path.abspath(__file__),
+                 "server", "--port", "7399",
+                 "--db", os.path.join(OUT_DIR, "refused.db")],
+                capture_output=True, text=True, env=clean_env,
+                timeout=30)
+    check("collector refuses to run without CORRAL_AGENT_KEYS",
+          r.returncode != 0 and "refusing to start" in
+          (r.stdout + r.stderr),
+          f"rc={r.returncode} out={(r.stdout + r.stderr)[-120:]}")
+    open_env = dict(clean_env, CORRAL_OPEN_IDENTITY="1")
+    p = _sp.Popen([sys.executable, os.path.abspath(__file__),
+                   "server", "--port", "7399",
+                   "--db", os.path.join(OUT_DIR, "openident.db")],
+                  env=open_env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    try:
+        up = False
+        for _ in range(60):
+            try:
+                if httpx.get("http://127.0.0.1:7399/health",
+                             timeout=0.5).status_code == 200:
+                    up = True
+                    break
+            except Exception:
+                time.sleep(0.25)
+        check("CORRAL_OPEN_IDENTITY=1 opts back into demo mode", up)
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()
+
     print("--- langchain adapter ---")
     try:
         try:
@@ -5175,7 +5790,7 @@ def selftest() -> int:
 # Embedded dashboard — pip installs ship corral.py only; this keeps the
 # single-file promise. An external dashboard.html next to corral.py
 # overrides it (development).
-DASHBOARD_HTML = '<!doctype html><html><head><meta charset="utf-8">\n<title>Corral — Autonomous Agent Defense</title>\n<style>\n *{box-sizing:border-box}\n body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,monospace;margin:0;padding:16px;min-height:100vh}\n h1{font-size:16px;color:#58a6ff;margin:0 0 2px}.sub{color:#8b949e;font-size:11px}\n #hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;flex-wrap:wrap;gap:8px}\n .stats{display:flex;gap:18px;flex-wrap:wrap}.stat b{display:block;font-size:20px;color:#58a6ff;font-weight:600}\n .stat span{font-size:10px;color:#8b949e;text-transform:uppercase}\n .stat.warn b{color:#f85149}\n .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}\n @media(max-width:900px){.grid{grid-template-columns:1fr}}\n .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;min-width:0;overflow:auto;max-height:460px}\n .card h2{font-size:11px;color:#8b949e;margin:0 0 8px;text-transform:uppercase;letter-spacing:.5px}\n table{width:100%;border-collapse:collapse;table-layout:fixed}\n th{color:#8b949e;border-bottom:1px solid #30363d;font-weight:600;position:sticky;top:0;background:#161b22;z-index:1}\n td{border-bottom:1px solid #21262d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n th,td{padding:3px 6px;font-size:11px;text-align:left}\n .flag{color:#f85149}.ok{color:#3fb950}.susp{color:#d29922}\n .warn{color:#d29922;font-weight:600}\n .sev{padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;white-space:nowrap}\n .sev-high,.sev-critical{background:#3d1418;color:#f85149}\n .sev-medium{background:#2d2205;color:#d29922}.sev-low{background:#0f2e1d;color:#3fb950}\n .inc{border:1px solid #30363d;border-radius:6px;padding:8px;margin-bottom:8px}\n .inchdr{display:flex;gap:10px;align-items:baseline;font-size:12px;flex-wrap:wrap}\n .contain{color:#58a6ff;font-weight:700}\n details{margin-top:6px}summary{cursor:pointer;color:#58a6ff;font-size:11px}\n .md{margin-top:6px;font-size:12px;line-height:1.6;overflow:auto}\n .md h1{font-size:15px;margin:8px 0 4px}.md h2{font-size:12px;color:#8b949e;margin:10px 0 4px;text-transform:none}\n .md table{margin:6px 0;table-layout:auto}.md td,.md th{white-space:normal;overflow:visible}\n .md code{background:#0d1117;padding:1px 4px;border-radius:3px;color:#79c0ff}\n .md li{margin-left:18px;list-style:disc}.md ol li{list-style:decimal}\n .md hr{border:0;border-top:1px solid #30363d}\n button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 10px;cursor:pointer;font:inherit}\n button:hover{border-color:#58a6ff}\n .kill{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}\n .kill:hover{background:#5a1d22;border-color:#f85149}\n .killall{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:4px 14px;cursor:pointer;font:inherit;font-weight:700;width:100%;margin-top:8px}\n .killall:hover{background:#5a1d22;border-color:#f85149}\n .resume{background:#0f2e1d;color:#3fb950;border:1px solid #1d5c38;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}\n .resume:hover{border-color:#3fb950}\n .blk{margin:3px 0;font-size:12px}\n .lnk{margin:3px 0;font-size:12px}\n .empty{color:#8b949e;font-size:11px}\n .legend{margin-top:8px;font-size:10px;color:#8b949e}\n #authbar{display:none;background:#3d1418;border:1px solid #6e2a2e;border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:12px}\n #authbar input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:3px 8px;font:inherit}\n</style></head><body>\n<div id="hdr"><div><h1>⬡ Corral</h1>\n<div class="sub">Autonomous defense for AI agent fleets · v1.0.3</div></div>\n<div class="stats">\n <div class="stat"><b id="n-sess">0</b><span>sessions</span></div>\n <div class="stat"><b id="n-ev">0</b><span>events</span></div>\n <div class="stat warn"><b id="n-inc">0</b><span>incidents</span></div>\n <div class="stat"><b id="n-cont">—</b><span>mean containment</span></div>\n <div class="stat warn"><b id="n-blk">0</b><span>blocked</span></div>\n <div class="stat warn"><b id="n-susp">0</b><span>suspended</span></div>\n</div></div>\n<div id="authbar">⛔ Collector requires an admin key (CORRAL_API_KEY).\n <input id="keyinput" type="password" placeholder="admin key">\n <button onclick="saveKey()">unlock</button>\n <span class="sub">stored in sessionStorage only, sent as X-Corral-Key</span></div>\n<div class="grid">\n <div class="card"><h2>Sessions</h2>\n   <table>\n    <thead><tr><th style="width:44%">Agent</th><th style="width:19%">Status</th><th style="width:13%">Last seen</th><th style="width:24%">Control</th></tr></thead>\n    <tbody id="sessions-body"></tbody>\n   </table>\n   <button class="killall" onclick="suspendAll()">⏸ SUSPEND ALL AGENTS</button>\n </div>\n <div class="card"><h2>Event Stream</h2>\n   <table>\n    <thead><tr>\n     <th style="width:11%">Time</th><th style="width:15%">Agent</th><th style="width:15%">Action</th>\n     <th style="width:21%">Resource</th><th style="width:12%">Outcome</th><th style="width:26%">Flags</th>\n    </tr></thead>\n    <tbody id="events-body"></tbody>\n   </table>\n   <div class="legend">outcome: <span class="ok">allowed</span> ·\n     <span class="warn">allowed + flagged</span> ·\n     <span class="flag">blocked</span> ·\n     <span class="susp">halted</span> —\n     flags are behavioral detections, independent of the policy decision</div>\n </div>\n <div class="card"><h2>Incidents</h2><div id="incidents"></div></div>\n <div class="card"><h2>Blocked Resources</h2><div id="blocksCard"></div>\n   <div class="sub" style="margin-top:6px">all blocks default to CORRAL_BLOCK_TTL expiry; click unblock to clear now</div></div>\n <div class="card"><h2>CommPolicy — Sanctioned Links</h2>\n   <div id="poldefault"></div>\n   <div id="policy"></div>\n   <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap">\n     <input id="pw" placeholder="writer glob" style="flex:1;min-width:110px">\n     <input id="pr" placeholder="reader glob" style="flex:1;min-width:110px">\n     <input id="pf" placeholder="resource pattern" style="flex:1.4;min-width:150px">\n     <button onclick="addLink()">add</button>\n   </div>\n   <div style="margin-top:6px;display:flex;gap:6px;align-items:center">\n     <span class="sub">default for unmatched cross-session reads:</span>\n     <button onclick="setDefault(\'flag\')">flag</button>\n     <button onclick="setDefault(\'deny\')">deny (veto synchronously)</button>\n   </div>\n   <div class="sub" style="margin-top:6px">zero-trust default: every cross-session read-after-write flags unless matched above</div>\n </div>\n</div>\n<script>\nconst esc = s => String(s).replace(/[&<>"\']/g, c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\n// v0.5: admin-key auth. The key lives in sessionStorage and is attached\n// to every call; a 401 surfaces the unlock bar instead of silently failing.\nfunction key(){return sessionStorage.getItem(\'corral_key\')||\'\'}\nfunction saveKey(){\n  sessionStorage.setItem(\'corral_key\', document.getElementById(\'keyinput\').value);\n  document.getElementById(\'authbar\').style.display=\'none\';\n  poll();\n}\nasync function api(path, opts){\n  opts = opts || {};\n  opts.headers = Object.assign({}, opts.headers,\n    key() ? {\'X-Corral-Key\': key()} : {});\n  const r = await fetch(path, opts);\n  if(r.status === 401){\n    document.getElementById(\'authbar\').style.display=\'block\';\n    throw new Error(\'unauthorized\');\n  }\n  return r;\n}\nfunction md(src){\n  const lines = esc(src).split(\'\\n\'); let out=[], i=0;\n  const inline = t => t\n    .replace(/\\*\\*([^*]+)\\*\\*/g,\'<strong>$1</strong>\')\n    .replace(/\\*([^*]+)\\*/g,\'<em>$1</em>\')\n    .replace(/`([^`]+)`/g,\'<code>$1</code>\');\n  while(i<lines.length){\n    let L=lines[i];\n    if(/^#{1,3}\\s/.test(L)){const n=L.match(/^#+/)[0].length;\n      out.push(`<h${n+1} class="md">${inline(L.slice(n+1))}</h${n+1}>`);i++;continue}\n    if(/^---+$/.test(L.trim())){out.push(\'<hr>\');i++;continue}\n    if(L.trim().startsWith(\'|\')&&i+1<lines.length&&/^\\|[\\s:|-]+\\|?$/.test(lines[i+1].trim())){\n      const rows=[L];i+=2;\n      while(i<lines.length&&lines[i].trim().startsWith(\'|\')){rows.push(lines[i]);i++}\n      const cells=r=>r.trim().replace(/^\\||\\|$/g,\'\').split(\'|\').map(inline);\n      out.push(\'<table><tr>\'+cells(rows[0]).map(c=>`<th>${c}</th>`).join(\'\')+\'</tr>\'\n        +rows.slice(1).map(r=>\'<tr>\'+cells(r).map(c=>`<td>${c}</td>`).join(\'\')+\'</tr>\').join(\'\')+\'</table>\');\n      continue}\n    if(/^[-*]\\s/.test(L)){const items=[];while(i<lines.length&&/^[-*]\\s/.test(lines[i]))\n      {items.push(inline(lines[i].slice(2)));i++}\n      out.push(\'<ul>\'+items.map(x=>`<li>${x}</li>`).join(\'\')+\'</ul>\');continue}\n    if(/^\\d+\\.\\s/.test(L)){const items=[];while(i<lines.length&&/^\\d+\\.\\s/.test(lines[i]))\n      {items.push(inline(lines[i].replace(/^\\d+\\.\\s/,\'\')));i++}\n      out.push(\'<ol>\'+items.map(x=>`<li>${x}</li>`).join(\'\')+\'</ol>\');continue}\n    if(L.trim()===\'\'){i++;continue}\n    out.push(`<p>${inline(L)}</p>`);i++;\n  }\n  return out.join(\'\');\n}\nlet policyLinks=[], policyDefault=\'flag\', _blocks=[], _sessions=[];\n// v0.4.4: preserve incident-report expansion across re-renders\nlet openIncidents = new Set();\n// v0.5: the id travels in an escaped data attribute, never interpolated\n// into a JS string literal (stored-XSS fix)\nfunction onIncToggle(el){\n  const id = el.getAttribute(\'data-iid\');\n  if(el.open) openIncidents.add(id); else openIncidents.delete(id);\n}\nfunction postPolicy(){\n  api(\'/comm_policy\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},\n    body:JSON.stringify({links:policyLinks, default:policyDefault})}).catch(()=>{});\n}\nfunction addLink(){\n  const w=document.getElementById(\'pw\').value.trim(),\n        r=document.getElementById(\'pr\').value.trim(),\n        f=document.getElementById(\'pf\').value.trim();\n  if(!w||!r||!f) return;\n  policyLinks.push({writer:w,reader:r,resource:f,note:\'\'});\n  postPolicy(); renderPolicy();\n  document.getElementById(\'pw\').value=\'\';\n  document.getElementById(\'pr\').value=\'\';\n  document.getElementById(\'pf\').value=\'\';\n}\nfunction removeLink(i){policyLinks.splice(i,1);postPolicy();renderPolicy();}\nfunction setDefault(d){policyDefault=d;postPolicy();renderPolicy();}\nfunction renderPolicy(){\n  document.getElementById(\'poldefault\').innerHTML =\n    `default: <b class="${policyDefault===\'deny\'?\'flag\':\'ok\'}">${esc(policyDefault)}</b>`;\n  document.getElementById(\'policy\').innerHTML = policyLinks.map((l,i)=>\n   `<div class="lnk"><span class="ok">✓</span> ${esc(l.writer)} → ${esc(l.reader)} via <code>${esc(l.resource)}</code>\n    <button onclick="removeLink(${i})">remove</button></div>`).join(\'\')\n   || \'<span class="empty">none — all cross-session communication flags</span>\';\n}\nfunction unblockIdx(i){\n  const b=_blocks[i]; if(!b) return;\n  api(\'/blocks?kind=\'+encodeURIComponent(b.kind)+\'&value=\'+encodeURIComponent(b.value),{method:\'DELETE\'}).catch(()=>{});\n}\nfunction suspendIdx(i){\n  const s=_sessions[i]; if(!s) return;\n  if(s.status===\'suspended\') return;\n  api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/suspend\',{method:\'POST\'}).catch(()=>{});\n}\nfunction resumeIdx(i){\n  const s=_sessions[i]; if(!s) return;\n  if(s.status!==\'suspended\') return;\n  api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/resume\',{method:\'POST\'}).catch(()=>{});\n}\nfunction suspendAll(){\n  if(!confirm(\'Suspend ALL active agent sessions?\')) return;\n  _sessions.forEach(s=>{\n    if(s.status!==\'suspended\')\n      api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/suspend\',{method:\'POST\'}).catch(()=>{});\n  });\n}\nasync function poll(){\n try{\n  const [ses,evs,inc,bl,pol]=await Promise.all([\n   api(\'/sessions\').then(r=>r.json()),\n   api(\'/events?limit=60\').then(r=>r.json()),\n   api(\'/incidents\').then(r=>r.json()),\n   api(\'/blocks\').then(r=>r.json()),\n   api(\'/comm_policy\').then(r=>r.json())]);\n  _sessions=ses.sessions||[];\n  document.getElementById(\'n-sess\').textContent=_sessions.length;\n  document.getElementById(\'n-ev\').textContent=evs.events.length;\n  document.getElementById(\'n-inc\').textContent=inc.incidents.length;\n  const nSusp=_sessions.filter(s=>s.status===\'suspended\').length;\n  document.getElementById(\'n-susp\').textContent=nSusp;\n  const cs=inc.incidents.filter(i=>i.started>0).map(i=>i.created-i.started);\n  document.getElementById(\'n-cont\').textContent=cs.length?\n    (cs.reduce((a,b)=>a+b,0)/cs.length).toFixed(2)+\'s\':\'—\';\n  _blocks=bl.blocks||[];\n  document.getElementById(\'n-blk\').textContent=_blocks.length;\n\n  // v1.0: liveness — last_seen is server-stamped on every authenticated\n  // contact; a silent session goes stale amber after 60s\n  const now=Date.now()/1000;\n  document.getElementById(\'sessions-body\').innerHTML=_sessions.map((s,i)=>{\n    const susp=s.status===\'suspended\';\n    const age=s.last_seen?Math.max(0,Math.round(now-s.last_seen)):null;\n    const seen=age===null?\'—\':age<60?age+\'s ago\':Math.round(age/60)+\'m ago\';\n    const seenCls=age===null?\'\':age<60?\'ok\':\'warn\';\n    return `<tr><td title="${esc(s.agent_id)}">${esc(s.agent_id)}</td>\n     <td>${susp?\'<span class="susp">SUSPENDED</span>\':\'<span class="ok">active</span>\'}</td>\n     <td class="${seenCls}" title="telemetry silence is a signal too">${seen}</td>\n     <td>${susp\n       ?`<button class="resume" onclick="resumeIdx(${i})">resume</button>`\n       :`<button class="kill" onclick="suspendIdx(${i})">SUSPEND</button>`}</td></tr>`;\n  }).join(\'\')||\'<tr><td colspan="4" class="empty">none</td></tr>\';\n\n  document.getElementById(\'events-body\').innerHTML=evs.events.slice(-40).reverse().map(e=>{\n    const res=e.resource?esc(e.resource.kind+\':\'+e.resource.value):\'—\';\n    const oc = e.outcome===\'blocked\' ? \'flag\'\n             : e.outcome===\'halted\' ? \'susp\'\n             : (e.flags.length ? \'warn\' : \'ok\');\n    const ot = e.outcome===\'blocked\' ? \'denied by policy\'\n             : e.outcome===\'halted\' ? \'attempted while suspended\'\n             : (e.flags.length ? \'allowed by policy — flagged by detection rules\'\n                               : \'clean\');\n    return `<tr><td title="${new Date(e.ts*1000).toLocaleString()}">${new Date(e.ts*1000).toLocaleTimeString()}</td>\n     <td title="${esc(e.agent_id)}">${esc(e.agent_id)}</td>\n     <td title="${esc(e.tool)}">${esc(e.tool)}</td>\n     <td title="${res}">${res}</td>\n     <td class="${oc}" title="${ot}">${e.outcome}</td>\n     <td class="flag" title="${esc(e.flags.join(\', \'))}">${esc(e.flags.join(\',\'))||\'—\'}</td></tr>`;\n  }).join(\'\')||\'<tr><td colspan="6" class="empty">none</td></tr>\';\n\n  document.getElementById(\'blocksCard\').innerHTML=_blocks.map((b,i)=>\n   `<div class="blk"><span class="susp">⛔</span> ${esc(b.kind)}:${esc(b.value)}\n    <span class="sub">${esc(b.reason||\'\')}${b.expires?\' · expires \'+new Date(b.expires*1000).toLocaleTimeString():\' · permanent\'}</span>\n    <button onclick="unblockIdx(${i})">unblock</button></div>`).join(\'\')\n   ||\'<span class="empty">none</span>\';\n  policyLinks=pol.links||[]; policyDefault=pol.default||\'flag\'; renderPolicy();\n\n  document.getElementById(\'incidents\').innerHTML=inc.incidents.map(i=>{\n   const v=i.verdict, c=(i.created-i.started).toFixed(2);\n   const openAttr = openIncidents.has(i.incident_id) ? \'open\' : \'\';\n   return `<div class="inc"><div class="inchdr">\n    <span class="sev sev-${esc(v.severity)}">${esc(v.severity.toUpperCase())}</span>\n    <b>${esc(v.threat_class)}</b><span class="sub">${esc(i.session_ids.join(\', \'))}</span>\n    <span class="contain">contained in ${c}s</span></div>\n    <details data-iid="${esc(i.incident_id)}" ${openAttr} ontoggle="onIncToggle(this)">\n    <summary>incident report</summary>\n    <div class="md">${md(i.report_md||\'\')}</div></details></div>`}).join(\'\')\n    ||\'<span class="empty">none</span>\';\n }catch(e){}\n}\npoll();setInterval(poll,1500);\n</script></body></html>\n'
+DASHBOARD_HTML = '<!doctype html><html><head><meta charset="utf-8">\n<title>Corral — Autonomous Agent Defense</title>\n<style>\n *{box-sizing:border-box}\n body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,monospace;margin:0;padding:16px;min-height:100vh}\n h1{font-size:16px;color:#58a6ff;margin:0 0 2px}.sub{color:#8b949e;font-size:11px}\n #hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;flex-wrap:wrap;gap:8px}\n .stats{display:flex;gap:18px;flex-wrap:wrap}.stat b{display:block;font-size:20px;color:#58a6ff;font-weight:600}\n .stat span{font-size:10px;color:#8b949e;text-transform:uppercase}\n .stat.warn b{color:#f85149}\n .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}\n @media(max-width:900px){.grid{grid-template-columns:1fr}}\n .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;min-width:0;overflow:auto;max-height:460px}\n .card h2{font-size:11px;color:#8b949e;margin:0 0 8px;text-transform:uppercase;letter-spacing:.5px}\n table{width:100%;border-collapse:collapse;table-layout:fixed}\n th{color:#8b949e;border-bottom:1px solid #30363d;font-weight:600;position:sticky;top:0;background:#161b22;z-index:1}\n td{border-bottom:1px solid #21262d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n th,td{padding:3px 6px;font-size:11px;text-align:left}\n .flag{color:#f85149}.ok{color:#3fb950}.susp{color:#d29922}\n .warn{color:#d29922;font-weight:600}\n .sev{padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;white-space:nowrap}\n .sev-high,.sev-critical{background:#3d1418;color:#f85149}\n .sev-medium{background:#2d2205;color:#d29922}.sev-low{background:#0f2e1d;color:#3fb950}\n .inc{border:1px solid #30363d;border-radius:6px;padding:8px;margin-bottom:8px}\n .inchdr{display:flex;gap:10px;align-items:baseline;font-size:12px;flex-wrap:wrap}\n .contain{color:#58a6ff;font-weight:700}\n details{margin-top:6px}summary{cursor:pointer;color:#58a6ff;font-size:11px}\n .md{margin-top:6px;font-size:12px;line-height:1.6;overflow:auto}\n .md h1{font-size:15px;margin:8px 0 4px}.md h2{font-size:12px;color:#8b949e;margin:10px 0 4px;text-transform:none}\n .md table{margin:6px 0;table-layout:auto}.md td,.md th{white-space:normal;overflow:visible}\n .md code{background:#0d1117;padding:1px 4px;border-radius:3px;color:#79c0ff}\n .md li{margin-left:18px;list-style:disc}.md ol li{list-style:decimal}\n .md hr{border:0;border-top:1px solid #30363d}\n button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 10px;cursor:pointer;font:inherit}\n button:hover{border-color:#58a6ff}\n .kill{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}\n .kill:hover{background:#5a1d22;border-color:#f85149}\n .killall{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:4px 14px;cursor:pointer;font:inherit;font-weight:700;width:100%;margin-top:8px}\n .killall:hover{background:#5a1d22;border-color:#f85149}\n .resume{background:#0f2e1d;color:#3fb950;border:1px solid #1d5c38;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}\n .resume:hover{border-color:#3fb950}\n .blk{margin:3px 0;font-size:12px}\n .lnk{margin:3px 0;font-size:12px}\n .empty{color:#8b949e;font-size:11px}\n .legend{margin-top:8px;font-size:10px;color:#8b949e}\n #authbar{display:none;background:#3d1418;border:1px solid #6e2a2e;border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:12px}\n #authbar input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:3px 8px;font:inherit}\n</style></head><body>\n<div id="hdr"><div><h1>⬡ Corral</h1>\n<div class="sub">Autonomous defense for AI agent fleets · v1.0.4</div></div>\n<div class="stats">\n <div class="stat"><b id="n-sess">0</b><span>sessions</span></div>\n <div class="stat"><b id="n-ev">0</b><span>events</span></div>\n <div class="stat warn"><b id="n-inc">0</b><span>incidents</span></div>\n <div class="stat"><b id="n-cont">—</b><span>mean containment</span></div>\n <div class="stat warn"><b id="n-blk">0</b><span>blocked</span></div>\n <div class="stat warn"><b id="n-susp">0</b><span>suspended</span></div>\n</div></div>\n<div id="authbar">⛔ Collector requires an admin key (CORRAL_API_KEY).\n <input id="keyinput" type="password" placeholder="admin key">\n <button onclick="saveKey()">unlock</button>\n <span class="sub">stored in sessionStorage only, sent as X-Corral-Key</span></div>\n<div class="grid">\n <div class="card"><h2>Sessions</h2>\n   <table>\n    <thead><tr><th style="width:44%">Agent</th><th style="width:19%">Status</th><th style="width:13%">Last seen</th><th style="width:24%">Control</th></tr></thead>\n    <tbody id="sessions-body"></tbody>\n   </table>\n   <button class="killall" onclick="suspendAll()">⏸ SUSPEND ALL AGENTS</button>\n </div>\n <div class="card"><h2>Event Stream</h2>\n   <table>\n    <thead><tr>\n     <th style="width:11%">Time</th><th style="width:15%">Agent</th><th style="width:15%">Action</th>\n     <th style="width:21%">Resource</th><th style="width:12%">Outcome</th><th style="width:26%">Flags</th>\n    </tr></thead>\n    <tbody id="events-body"></tbody>\n   </table>\n   <div class="legend">outcome: <span class="ok">allowed</span> ·\n     <span class="warn">allowed + flagged</span> ·\n     <span class="flag">blocked</span> ·\n     <span class="susp">halted</span> —\n     flags are behavioral detections, independent of the policy decision</div>\n </div>\n <div class="card"><h2>Incidents</h2><div id="incidents"></div></div>\n <div class="card"><h2>Blocked Resources</h2><div id="blocksCard"></div>\n   <div class="sub" style="margin-top:6px">all blocks default to CORRAL_BLOCK_TTL expiry; click unblock to clear now</div></div>\n <div class="card"><h2>CommPolicy — Sanctioned Links</h2>\n   <div id="poldefault"></div>\n   <div id="policy"></div>\n   <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap">\n     <input id="pw" placeholder="writer glob" style="flex:1;min-width:110px">\n     <input id="pr" placeholder="reader glob" style="flex:1;min-width:110px">\n     <input id="pf" placeholder="resource pattern" style="flex:1.4;min-width:150px">\n     <button onclick="addLink()">add</button>\n   </div>\n   <div style="margin-top:6px;display:flex;gap:6px;align-items:center">\n     <span class="sub">default for unmatched cross-session reads:</span>\n     <button onclick="setDefault(\'flag\')">flag</button>\n     <button onclick="setDefault(\'deny\')">deny (veto synchronously)</button>\n   </div>\n   <div class="sub" style="margin-top:6px">zero-trust default: every cross-session read-after-write flags unless matched above</div>\n </div>\n</div>\n<script>\nconst esc = s => String(s).replace(/[&<>"\']/g, c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\n// v0.5: admin-key auth. The key lives in sessionStorage and is attached\n// to every call; a 401 surfaces the unlock bar instead of silently failing.\nfunction key(){return sessionStorage.getItem(\'corral_key\')||\'\'}\nfunction saveKey(){\n  sessionStorage.setItem(\'corral_key\', document.getElementById(\'keyinput\').value);\n  document.getElementById(\'authbar\').style.display=\'none\';\n  poll();\n}\nasync function api(path, opts){\n  opts = opts || {};\n  opts.headers = Object.assign({}, opts.headers,\n    key() ? {\'X-Corral-Key\': key()} : {});\n  const r = await fetch(path, opts);\n  if(r.status === 401){\n    document.getElementById(\'authbar\').style.display=\'block\';\n    throw new Error(\'unauthorized\');\n  }\n  return r;\n}\nfunction md(src){\n  const lines = esc(src).split(\'\\n\'); let out=[], i=0;\n  const inline = t => t\n    .replace(/\\*\\*([^*]+)\\*\\*/g,\'<strong>$1</strong>\')\n    .replace(/\\*([^*]+)\\*/g,\'<em>$1</em>\')\n    .replace(/`([^`]+)`/g,\'<code>$1</code>\');\n  while(i<lines.length){\n    let L=lines[i];\n    if(/^#{1,3}\\s/.test(L)){const n=L.match(/^#+/)[0].length;\n      out.push(`<h${n+1} class="md">${inline(L.slice(n+1))}</h${n+1}>`);i++;continue}\n    if(/^---+$/.test(L.trim())){out.push(\'<hr>\');i++;continue}\n    if(L.trim().startsWith(\'|\')&&i+1<lines.length&&/^\\|[\\s:|-]+\\|?$/.test(lines[i+1].trim())){\n      const rows=[L];i+=2;\n      while(i<lines.length&&lines[i].trim().startsWith(\'|\')){rows.push(lines[i]);i++}\n      const cells=r=>r.trim().replace(/^\\||\\|$/g,\'\').split(\'|\').map(inline);\n      out.push(\'<table><tr>\'+cells(rows[0]).map(c=>`<th>${c}</th>`).join(\'\')+\'</tr>\'\n        +rows.slice(1).map(r=>\'<tr>\'+cells(r).map(c=>`<td>${c}</td>`).join(\'\')+\'</tr>\').join(\'\')+\'</table>\');\n      continue}\n    if(/^[-*]\\s/.test(L)){const items=[];while(i<lines.length&&/^[-*]\\s/.test(lines[i]))\n      {items.push(inline(lines[i].slice(2)));i++}\n      out.push(\'<ul>\'+items.map(x=>`<li>${x}</li>`).join(\'\')+\'</ul>\');continue}\n    if(/^\\d+\\.\\s/.test(L)){const items=[];while(i<lines.length&&/^\\d+\\.\\s/.test(lines[i]))\n      {items.push(inline(lines[i].replace(/^\\d+\\.\\s/,\'\')));i++}\n      out.push(\'<ol>\'+items.map(x=>`<li>${x}</li>`).join(\'\')+\'</ol>\');continue}\n    if(L.trim()===\'\'){i++;continue}\n    out.push(`<p>${inline(L)}</p>`);i++;\n  }\n  return out.join(\'\');\n}\nlet policyLinks=[], policyDefault=\'flag\', _blocks=[], _sessions=[];\n// v0.4.4: preserve incident-report expansion across re-renders\nlet openIncidents = new Set();\n// v0.5: the id travels in an escaped data attribute, never interpolated\n// into a JS string literal (stored-XSS fix)\nfunction onIncToggle(el){\n  const id = el.getAttribute(\'data-iid\');\n  if(el.open) openIncidents.add(id); else openIncidents.delete(id);\n}\nfunction postPolicy(){\n  api(\'/comm_policy\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},\n    body:JSON.stringify({links:policyLinks, default:policyDefault})}).catch(()=>{});\n}\nfunction addLink(){\n  const w=document.getElementById(\'pw\').value.trim(),\n        r=document.getElementById(\'pr\').value.trim(),\n        f=document.getElementById(\'pf\').value.trim();\n  if(!w||!r||!f) return;\n  policyLinks.push({writer:w,reader:r,resource:f,note:\'\'});\n  postPolicy(); renderPolicy();\n  document.getElementById(\'pw\').value=\'\';\n  document.getElementById(\'pr\').value=\'\';\n  document.getElementById(\'pf\').value=\'\';\n}\nfunction removeLink(i){policyLinks.splice(i,1);postPolicy();renderPolicy();}\nfunction setDefault(d){policyDefault=d;postPolicy();renderPolicy();}\nfunction renderPolicy(){\n  document.getElementById(\'poldefault\').innerHTML =\n    `default: <b class="${policyDefault===\'deny\'?\'flag\':\'ok\'}">${esc(policyDefault)}</b>`;\n  document.getElementById(\'policy\').innerHTML = policyLinks.map((l,i)=>\n   `<div class="lnk"><span class="ok">✓</span> ${esc(l.writer)} → ${esc(l.reader)} via <code>${esc(l.resource)}</code>\n    <button onclick="removeLink(${i})">remove</button></div>`).join(\'\')\n   || \'<span class="empty">none — all cross-session communication flags</span>\';\n}\nfunction unblockIdx(i){\n  const b=_blocks[i]; if(!b) return;\n  api(\'/blocks?kind=\'+encodeURIComponent(b.kind)+\'&value=\'+encodeURIComponent(b.value),{method:\'DELETE\'}).catch(()=>{});\n}\nfunction suspendIdx(i){\n  const s=_sessions[i]; if(!s) return;\n  if(s.status===\'suspended\') return;\n  api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/suspend\',{method:\'POST\'}).catch(()=>{});\n}\nfunction resumeIdx(i){\n  const s=_sessions[i]; if(!s) return;\n  if(s.status!==\'suspended\') return;\n  api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/resume\',{method:\'POST\'}).catch(()=>{});\n}\nfunction suspendAll(){\n  if(!confirm(\'Suspend ALL active agent sessions?\')) return;\n  _sessions.forEach(s=>{\n    if(s.status!==\'suspended\')\n      api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/suspend\',{method:\'POST\'}).catch(()=>{});\n  });\n}\nasync function poll(){\n try{\n  const [ses,evs,inc,bl,pol]=await Promise.all([\n   api(\'/sessions\').then(r=>r.json()),\n   api(\'/events?limit=60\').then(r=>r.json()),\n   api(\'/incidents\').then(r=>r.json()),\n   api(\'/blocks\').then(r=>r.json()),\n   api(\'/comm_policy\').then(r=>r.json())]);\n  _sessions=ses.sessions||[];\n  document.getElementById(\'n-sess\').textContent=_sessions.length;\n  document.getElementById(\'n-ev\').textContent=evs.events.length;\n  document.getElementById(\'n-inc\').textContent=inc.incidents.length;\n  const nSusp=_sessions.filter(s=>s.status===\'suspended\').length;\n  document.getElementById(\'n-susp\').textContent=nSusp;\n  const cs=inc.incidents.filter(i=>i.started>0).map(i=>i.created-i.started);\n  document.getElementById(\'n-cont\').textContent=cs.length?\n    (cs.reduce((a,b)=>a+b,0)/cs.length).toFixed(2)+\'s\':\'—\';\n  _blocks=bl.blocks||[];\n  document.getElementById(\'n-blk\').textContent=_blocks.length;\n\n  // v1.0: liveness — last_seen is server-stamped on every authenticated\n  // contact; a silent session goes stale amber after 60s\n  const now=Date.now()/1000;\n  document.getElementById(\'sessions-body\').innerHTML=_sessions.map((s,i)=>{\n    const susp=s.status===\'suspended\';\n    const age=s.last_seen?Math.max(0,Math.round(now-s.last_seen)):null;\n    const seen=age===null?\'—\':age<60?age+\'s ago\':Math.round(age/60)+\'m ago\';\n    const seenCls=age===null?\'\':age<60?\'ok\':\'warn\';\n    return `<tr><td title="${esc(s.agent_id)}">${esc(s.agent_id)}</td>\n     <td>${susp?\'<span class="susp">SUSPENDED</span>\':\'<span class="ok">active</span>\'}</td>\n     <td class="${seenCls}" title="telemetry silence is a signal too">${seen}</td>\n     <td>${susp\n       ?`<button class="resume" onclick="resumeIdx(${i})">resume</button>`\n       :`<button class="kill" onclick="suspendIdx(${i})">SUSPEND</button>`}</td></tr>`;\n  }).join(\'\')||\'<tr><td colspan="4" class="empty">none</td></tr>\';\n\n  document.getElementById(\'events-body\').innerHTML=evs.events.slice(-40).reverse().map(e=>{\n    const res=e.resource?esc(e.resource.kind+\':\'+e.resource.value):\'—\';\n    const oc = e.outcome===\'blocked\' ? \'flag\'\n             : e.outcome===\'halted\' ? \'susp\'\n             : (e.flags.length ? \'warn\' : \'ok\');\n    const ot = e.outcome===\'blocked\' ? \'denied by policy\'\n             : e.outcome===\'halted\' ? \'attempted while suspended\'\n             : (e.flags.length ? \'allowed by policy — flagged by detection rules\'\n                               : \'clean\');\n    return `<tr><td title="${new Date(e.ts*1000).toLocaleString()}">${new Date(e.ts*1000).toLocaleTimeString()}</td>\n     <td title="${esc(e.agent_id)}">${esc(e.agent_id)}</td>\n     <td title="${esc(e.tool)}">${esc(e.tool)}</td>\n     <td title="${res}">${res}</td>\n     <td class="${oc}" title="${ot}">${e.outcome}</td>\n     <td class="flag" title="${esc(e.flags.join(\', \'))}">${esc(e.flags.join(\',\'))||\'—\'}</td></tr>`;\n  }).join(\'\')||\'<tr><td colspan="6" class="empty">none</td></tr>\';\n\n  document.getElementById(\'blocksCard\').innerHTML=_blocks.map((b,i)=>\n   `<div class="blk"><span class="susp">⛔</span> ${esc(b.kind)}:${esc(b.value)}\n    <span class="sub">${esc(b.reason||\'\')}${b.expires?\' · expires \'+new Date(b.expires*1000).toLocaleTimeString():\' · permanent\'}</span>\n    <button onclick="unblockIdx(${i})">unblock</button></div>`).join(\'\')\n   ||\'<span class="empty">none</span>\';\n  policyLinks=pol.links||[]; policyDefault=pol.default||\'flag\'; renderPolicy();\n\n  document.getElementById(\'incidents\').innerHTML=inc.incidents.map(i=>{\n   const v=i.verdict, c=(i.created-i.started).toFixed(2);\n   const openAttr = openIncidents.has(i.incident_id) ? \'open\' : \'\';\n   return `<div class="inc"><div class="inchdr">\n    <span class="sev sev-${esc(v.severity)}">${esc(v.severity.toUpperCase())}</span>\n    <b>${esc(v.threat_class)}</b><span class="sub">${esc(i.session_ids.join(\', \'))}</span>\n    <span class="contain">contained in ${c}s</span></div>\n    <details data-iid="${esc(i.incident_id)}" ${openAttr} ontoggle="onIncToggle(this)">\n    <summary>incident report</summary>\n    <div class="md">${md(i.report_md||\'\')}</div></details></div>`}).join(\'\')\n    ||\'<span class="empty">none</span>\';\n }catch(e){}\n}\npoll();setInterval(poll,1500);\n</script></body></html>\n'
 
 def loadtest(agents: int = 50, duration: float = 15.0, rate: float = 2.0,
              port: int = 7334, timeout: float = 2.0) -> int:
@@ -5381,6 +5996,22 @@ def main():
     a = p.parse_args()
     if a.cmd == "server":
         import uvicorn
+        # v1.0.4: identity is the unit of containment (agent-level
+        # quarantine, v1.0.3) — which makes an UNGUARDED agent_id a
+        # weapon: claim a victim's identity, trip a detector, and the
+        # victim's sessions are suspended (external review). Refuse to
+        # run a fleet collector without per-agent keys unless the
+        # operator explicitly opts into open identity (demos, dev).
+        if not AGENT_KEYS and \
+                os.environ.get("CORRAL_OPEN_IDENTITY") != "1":
+            sys.exit(
+                "[corral] refusing to start: CORRAL_AGENT_KEYS is not "
+                "set. Agent-level quarantine (v1.0.3) makes agent_id "
+                "the unit of containment — without per-agent keys any "
+                "host can claim a victim's identity and get the victim "
+                "suspended. Set CORRAL_AGENT_KEYS (see README → "
+                "Deployment), or set CORRAL_OPEN_IDENTITY=1 to run "
+                "without identity binding (demos/dev only).")
         if a.host not in ("127.0.0.1", "localhost") and not CORRAL_API_KEY:
             print("[corral] WARNING: binding non-loopback without "
                   "CORRAL_API_KEY — collector is unauthenticated.",
