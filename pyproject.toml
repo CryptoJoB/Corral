@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "corral"
-version = "1.0.1"
+version = "1.0.3"
 description = "Autonomous defense for AI agent fleets — single file, zero-trust inter-agent communication"
 readme = "README.md"
 requires-python = ">=3.10"

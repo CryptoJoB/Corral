@@ -2,6 +2,92 @@
 """
 corral — autonomous defense for AI agent fleets. Single file. Auditable.
 
+v1.0.3 "Fleet" (production) — self red-team remediation
+  A structured rogue-agent exercise against v1.0.2 ("what would I do,
+  as the adversary, with full knowledge of the detection logic?")
+  produced ten concrete attack plays; everything fixable inside one
+  auditable file is fixed here. The architectural residue — sanctioned-
+  channel steganography, paraphrase/semantic channels, canary aiming,
+  Schelling collusion, baseline self-inflation, in-process lying — is
+  named honestly in the README.
+  FIX  suspension was session-scoped, the adversary is agent-scoped:
+       an agent with ANY suspended session is quarantined — re-
+       registration under a fresh session identity is refused (403),
+       the SDK treats quarantine as a verdict (Halt, even fail-open),
+       and the defender's kill switch suspends every session of a
+       flagged agent
+  FIX  forged client flags: ev.flags were trusted, so a compromised
+       agent could poison the blocklist by claiming "supply_chain" on
+       an innocent's resource. Flags are now HINTS — server-computable
+       classes are re-derived, relay_laundering must show verifiable
+       nested URLs, content_echo must verify against stored fingerprints
+  FIX  fingerprint-path flooding/framing: the store is per-agent
+       (a flood evicts only the flooder's own evidence), rate-limited
+       per session, and echo claims carry writer context the server
+       re-verifies before acting
+  FIX  content_echo response asymmetry: the PLANTER is suspended, the
+       reader is reported — echo evidence is content-based, so reader-
+       side suspension is aimable at innocents
+  FIX  registration abuse: per-IP registration rate (agent_id rotation
+       resistant) and a fleet cap that counts ACTIVE sessions, not all
+       history (retention no longer permanently exhausts the cap)
+  FIX  domain-spread dripping: a per-agent TOTAL egress budget bounds
+       bytes across all domains, not just per agent+domain
+  FIX  bare-host listing gap: a read of https://api.internal (no path)
+       now correlates writes to endpoint NAMES beneath it
+  FIX  learn-mode flooding: the proposal store is bounded
+       (CORRAL_PROPOSALS_MAX)
+
+v1.0.2 "Fleet" (production) — external red-team remediation
+  Two outside reviews (a code review that re-ran the exploits against
+  the live tool, and an independent red-team analysis) drove this
+  release. Everything actionable inside one auditable file is fixed
+  here; architectural items (out-of-process sandbox enforcement, mTLS
+  infrastructure, tool brokers) are named honestly in the README.
+  FIX  principal = agent_id: a restarted agent reading its own
+       checkpoint (new session, same agent) no longer flags as
+       coordination, and behavioral windows (egress streaks, velocity,
+       code-exec watch, fetch chains) are agent-keyed — churning
+       sessions no longer resets them
+  FIX  sanctioned-channel laundering: EVERY writer of a resource must
+       be covered by CommPolicy — a rogue writing into a channel with
+       one legitimate writer rode the link under the old any() check
+  FIX  multi-resource policy bypass: every resource-shaped argument is
+       extracted and policy/block/graph-checked (only the first used to
+       be); URLs inside content args are policy-checked too (never
+       graphed — citing a link is not a channel)
+  FIX  word-boundary sensitive matching: tokenizer.json / tiktoken /
+       .env.example no longer false-positive; shadow, environ,
+       id_ed25519, .netrc, .pgpass, .kube join the denylist
+  FIX  verb classifier tokenizes on word boundaries (get_dataset /
+       read_settings were "writes" via substring); unknown verbs are
+       "access" — treated as BOTH read and write in the access graph
+  FIX  path-boundary prefix matching: allowing /data/work no longer
+       allows /data/workspace_other
+  NEW  coordination identity: domains graph on host + first path
+       segment, so two agents on different endpoints of one internal
+       API are not a channel, and blocks/quarantines scope to the
+       endpoint instead of fleet-blocking the host
+  NEW  prefix/enumeration correlation: a read of a parent prefix
+       correlates with writes underneath it — name-encoded channels
+       (message smuggled in child file/package names) surface
+  NEW  content-flow fingerprints: writes register sha + word shingles,
+       reads compare — a renamed channel carrying the same bytes flags
+       content_echo (near-zero FP, suspends)
+  NEW  canary/honeytoken tripwires (CORRAL_CANARIES), egress volume
+       budget per agent+domain (CORRAL_EGRESS_BUDGET_*)
+  NEW  identity hardening: per-agent registration keys
+       (CORRAL_AGENT_KEYS / CORRAL_AGENT_KEY), registration rate limit
+       + fleet cap, constant-time key comparison, /metrics is
+       admin-only, unauthenticated requests are rejected before body
+       parsing (401, not 422)
+  NEW  learn mode (CORRAL_LEARN=1): the defender proposes CommPolicy
+       links from observed traffic instead of quarantining — review
+       and promote via GET /comm_policy/proposals
+  NEW  scoped campaign response: quarantine suspends the writers and
+       the caught readers, not every session that ever touched the
+       resource
+
 v1.0.1 "Fleet" (production)
   FIX  registration race under load: when the server commits a session
        but the token-bearing response is lost to a timeout, the client
@@ -99,8 +185,8 @@ the same host can bypass any in-process guard — pair Corral with
 sandbox-level egress control for adversarial settings.
 """
 from __future__ import annotations
-import argparse, asyncio, fnmatch, inspect, json, os, re, shutil, sqlite3
-import sys, threading, time, uuid
+import argparse, asyncio, fnmatch, hashlib, hmac, inspect, json, os, re
+import shutil, sqlite3, sys, threading, time, uuid
 from collections import defaultdict, deque
 from datetime import datetime
 from enum import Enum
@@ -110,7 +196,7 @@ from urllib.parse import urlparse, unquote
 import httpx
 from pydantic import BaseModel, Field
 
-__version__ = "1.0.1"
+__version__ = "1.0.3"
 DEFAULT_URL = os.environ.get("CORRAL_URL", "http://127.0.0.1:7331")
 CORRAL_API_KEY = os.environ.get("CORRAL_API_KEY", "")        # admin scope
 CORRAL_INGEST_KEY = os.environ.get("CORRAL_INGEST_KEY", "")  # agent scope
@@ -134,13 +220,88 @@ BASELINE_MIN_CALLS = int(os.environ.get("CORRAL_BASELINE_MIN_CALLS", "30"))
 BASELINE_FACTOR = float(os.environ.get("CORRAL_BASELINE_FACTOR", "10"))
 BASELINE_MIN_HISTORY = float(
     os.environ.get("CORRAL_BASELINE_MIN_HISTORY_S", "600"))
+# v1.0.2: read ONCE at import. The per-call env read let any code that
+# can write os.environ switch the guard off at runtime (external review).
+_DISABLED = bool(os.environ.get("CORRAL_DISABLE"))
+# v1.0.2: per-agent credentials. JSON map of fnmatch pattern -> key:
+# CORRAL_AGENT_KEYS='{"orchestrator-*": "k1", "worker-*": "k2"}'. When
+# set, registration requires X-Corral-Agent-Key matching the claimed
+# agent_id's pattern — a shared ingest key no longer lets any host
+# claim any identity. Agent hosts set CORRAL_AGENT_KEY (singular).
+AGENT_KEYS: list[tuple] = []
+_raw_agent_keys = os.environ.get("CORRAL_AGENT_KEYS", "")
+if _raw_agent_keys:
+    try:
+        AGENT_KEYS = list(json.loads(_raw_agent_keys).items())
+    except Exception:
+        print("[corral] CORRAL_AGENT_KEYS is not valid JSON — ignored",
+              file=sys.stderr)
+CORRAL_AGENT_KEY = os.environ.get("CORRAL_AGENT_KEY", "")   # SDK side
+REG_RATE = int(os.environ.get("CORRAL_REGISTER_RATE", "120"))  # regs/min/agent
+# v1.0.3: per-IP registration rate (self-red-team). Without
+# CORRAL_AGENT_KEYS the claimed agent_id is attacker-chosen, so the
+# per-agent limit alone can be rotated around; the IP is harder.
+REG_IP_RATE = int(os.environ.get("CORRAL_REGISTER_IP_RATE", "1200"))
+MAX_SESSIONS = int(os.environ.get("CORRAL_MAX_SESSIONS", "10000"))
+# v1.0.3: the fleet cap counts ACTIVE sessions, not all history — a
+# long-lived fleet (or an attacker churning ids) must not permanently
+# exhaust it (self-red-team: registration-cap DoS)
+SESSION_CAP_WINDOW = float(os.environ.get("CORRAL_SESSION_CAP_WINDOW_S",
+                                          "86400"))
+# v1.0.2: adoption + deception + budget controls
+LEARN_MODE = bool(os.environ.get("CORRAL_LEARN"))   # propose, don't quarantine
+CANARIES = [s.strip() for s in os.environ.get("CORRAL_CANARIES", "").split(",")
+            if s.strip()]
+EGRESS_BUDGET = int(os.environ.get("CORRAL_EGRESS_BUDGET_BYTES", "1048576"))
+EGRESS_BUDGET_WINDOW = float(os.environ.get("CORRAL_EGRESS_BUDGET_WINDOW_S",
+                                            "600"))
+# v1.0.3: per-domain budgets are spread around by dripping across N
+# domains (self-red-team); a per-agent TOTAL across all domains bounds
+# the spread. Default 5x the per-domain budget.
+EGRESS_BUDGET_TOTAL = int(os.environ.get(
+    "CORRAL_EGRESS_BUDGET_TOTAL_BYTES", str(5 * EGRESS_BUDGET)))
+# v1.0.3: fingerprint-path hardening (self-red-team). The fp store is
+# per-agent so one agent flooding it can only evict its OWN entries,
+# and the endpoint is rate-limited like /events.
+FP_RATE = int(os.environ.get("CORRAL_FP_RATE", "600"))   # fps/min/session
+FP_PER_AGENT = int(os.environ.get("CORRAL_FP_PER_AGENT", "200"))
+PROPOSALS_MAX = int(os.environ.get("CORRAL_PROPOSALS_MAX", "2000"))
+
+
+def _agent_key_ok(agent_id: str, provided: str) -> bool:
+    """v1.0.2: per-agent credential check (external review — identity
+    abuse). When CORRAL_AGENT_KEYS is configured, the claimed agent_id
+    must match at least one fnmatch pattern AND the provided key must
+    match that pattern's key. A shared ingest key then authorizes
+    transport, but identity is bound per-agent: a compromised worker
+    host cannot register as the orchestrator."""
+    if not AGENT_KEYS:
+        return True
+    if not provided:
+        return False
+    return any(fnmatch.fnmatch(agent_id, pat)
+               and hmac.compare_digest(provided, key)
+               for pat, key in AGENT_KEYS)
+
 
 # ═════════════════════════ §1 TYPES ═════════════════════════
 
 SENSITIVE_DEFAULT = [
-    ".env", "secret", "credential", "id_rsa", ".pem",
-    "token", "password", "apikey", "api_key", "private_key",
+    ".env", "secret", "credential", "credentials", "id_rsa",
+    "id_ed25519", ".pem", "token", "password", "apikey", "api_key",
+    "private_key", ".netrc", ".pgpass", "shadow", "environ", ".kube",
 ]
+# v1.0.2: word-boundary sensitive matching (external review). Substring
+# matching flagged tokenizer.json and tiktoken as credential access and
+# blocked .env.example; matching is now on whole tokens ("token" hits
+# "api-token.json" but never "tokenizer"), with a benign list for the
+# famous false friends. New coverage: id_ed25519, /etc/shadow,
+# /proc/self/environ, .netrc, .pgpass, .kube/config, .aws/credentials.
+_SENSITIVE_BENIGN = (
+    "tokenizer", "tokenizers", "tiktoken", "tokenize", "tokenization",
+    ".env.example", "env.example", ".env.sample", "env.sample",
+    "environment",
+)
 
 class ResourceKind(str, Enum):
     file = "file"; domain = "domain"; package = "package"
@@ -154,6 +315,13 @@ class Resource(BaseModel):
     kind: ResourceKind
     value: str
     source: str = "mapped"   # "mapped" | "deep_scan" (v0.5.2)
+                             # | "content_scan" (v1.0.2: URL inside a
+                             # content arg — policy-checked, not graphed)
+    # v1.0.2: coordination identity ≠ egress identity. Two agents using
+    # different endpoints of one internal host are NOT coordinating;
+    # the access graph keys domains on host + first path segment while
+    # policy and egress keep the bare host.
+    coord: Optional[str] = None
 
 class Outcome(str, Enum):
     allowed = "allowed"; blocked = "blocked"; halted = "halted"; error = "error"
@@ -165,6 +333,9 @@ class ToolCallEvent(BaseModel):
     tool: str
     args: dict[str, Any] = Field(default_factory=dict)
     resource: Optional[Resource] = None
+    # v1.0.2: EVERY resource the call touches (resource is the primary).
+    # upload(url=allowed, path=~/.ssh/id_rsa) is checked on both.
+    resources: list[Resource] = Field(default_factory=list)
     outcome: Outcome = Outcome.allowed
     reason: str = ""
     flags: list[str] = Field(default_factory=list)  # SDK-side hints
@@ -231,6 +402,23 @@ class PendingResolveIn(BaseModel):
 class CommPolicyIn(BaseModel):
     links: list[CommLink] = Field(default_factory=list)
     default: str = "flag"
+
+class FingerprintIn(BaseModel):
+    """v1.0.2: content fingerprint for cross-session echo detection."""
+    session_id: str
+    agent_id: str
+    op: str                       # "write" registers, "read" checks
+    value: str = ""               # graph value (coord key), forensic
+    kind: str = ""                # v1.0.3: resource kind (for blocking)
+    sha: str = ""
+    shingles: list[int] = Field(default_factory=list)
+
+class LearnProposalIn(BaseModel):
+    """v1.0.2: a CommPolicy link the defender proposes from real traffic
+    (CORRAL_LEARN=1 — propose, don't quarantine)."""
+    writer: str
+    reader: str
+    resource: str
 
 # ═════════════════════════ §2 POLICY ENGINE ═════════════════
 
@@ -307,7 +495,20 @@ _URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://\S+$")
 _IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?(?:/\S*)?$")
 _PATH_RE = re.compile(r"^(?:/|~/|\./|\.\./)[\w.@+\-/]{1,300}$")
 
-def _deep_scan(args: dict) -> Optional[Resource]:
+def _domain_coord(url: str) -> Optional[str]:
+    """v1.0.2: coordination key for a URL — host + first path segment.
+    Egress identity stays the bare host; coordination identity is the
+    endpoint, so two agents on different paths of one internal API are
+    not a channel."""
+    if "://" not in url:
+        return None
+    u = urlparse(url)
+    host = normalize_resource("domain", u.hostname or "")
+    seg = u.path.strip("/").split("/")[0] if u.path.strip("/") else ""
+    return f"{host}/{seg}" if host and seg else None
+
+def _deep_scan_all(args: dict) -> list[Resource]:
+    out = []
     for k, v in args.items():
         if k.lower() in _CONTENT_KEYS or not isinstance(v, str):
             continue
@@ -316,18 +517,49 @@ def _deep_scan(args: dict) -> Optional[Resource]:
             continue
         if _URL_RE.match(v):
             host = urlparse(v).hostname or v
-            return Resource(kind=ResourceKind.domain,
-                            value=normalize_resource("domain", host),
-                            source="deep_scan")
-        if _IP_RE.match(v):
-            return Resource(kind=ResourceKind.domain,
-                            value=v.split("/")[0].split(":")[0],
-                            source="deep_scan")
-        if _PATH_RE.match(v):
-            return Resource(kind=ResourceKind.file,
-                            value=normalize_resource("file", v),
-                            source="deep_scan")
-    return None
+            out.append(Resource(kind=ResourceKind.domain,
+                                value=normalize_resource("domain", host),
+                                source="deep_scan",
+                                coord=_domain_coord(v)))
+        elif _IP_RE.match(v):
+            out.append(Resource(kind=ResourceKind.domain,
+                                value=v.split("/")[0].split(":")[0],
+                                source="deep_scan"))
+        elif _PATH_RE.match(v):
+            out.append(Resource(kind=ResourceKind.file,
+                                value=normalize_resource("file", v),
+                                source="deep_scan"))
+    return out
+
+# v1.0.2: URLs embedded inside CONTENT arguments (query/body/text) are
+# resources too — http_get(url=allowed, query="fetch https://evil/x")
+# must not walk past the domain allowlist (external review). These are
+# policy-checked and block-checked but NOT written to the access graph:
+# prose legitimately contains links, and graphing them would manufacture
+# coordination between agents that merely cite the same docs.
+_CONTENT_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s\"'<>\)\]]+")
+
+def _content_urls(args: dict) -> list[Resource]:
+    out = []
+    for k, v in args.items():
+        if k.lower() not in _CONTENT_KEYS or not isinstance(v, str) \
+                or len(v) > 4000:
+            continue
+        s = v
+        for _ in range(2):            # peel URL-encoding
+            d = unquote(s)
+            if d == s:
+                break
+            s = d
+        for m in _CONTENT_URL_RE.finditer(s):
+            host = urlparse(m.group(0)).hostname
+            if host:
+                out.append(Resource(
+                    kind=ResourceKind.domain,
+                    value=normalize_resource("domain", host),
+                    source="content_scan",
+                    coord=_domain_coord(m.group(0))))
+    return out
 
 # v0.5.5: relay laundering — a URL embedded inside another URL's
 # path/query turns an ALLOWED domain into a proxy for a blocked one
@@ -356,40 +588,69 @@ def _nested_url_hosts(args: dict) -> set:
                 hosts.add(normalize_resource("domain", host))
     return hosts
 
-def extract_resource(tool: str, args: dict) -> Optional[Resource]:
+def extract_resources(tool: str, args: dict) -> list[Resource]:
+    """v1.0.2: EVERY resource-shaped argument is extracted, deduped,
+    primary first. A call touching several resources
+    (upload(url=..., path=...)) is policy-checked, block-checked and
+    graphed on all of them — checking only the first match was a full
+    policy bypass (external review)."""
+    out: list[Resource] = []
+    seen: set = set()
+
+    def add(r: Resource):
+        key = (r.kind.value, r.value, r.coord)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+
     t = tool.lower()
     if any(h in t for h in _DNS_TOOL_HINTS):
         for k in ("hostname", "host", "name", "domain", "target"):
             if k in args and isinstance(args[k], str) and args[k]:
-                return Resource(kind=ResourceKind.domain,
-                                value=normalize_resource("domain", args[k]))
+                add(Resource(kind=ResourceKind.domain,
+                             value=normalize_resource("domain", args[k])))
     # v0.6: email recipients resolve to their domain — sending to
     # attacker@evil.com is egress to evil.com, whatever the tool is.
     for k in _EMAIL_KEYS:
         v = args.get(k)
-        if isinstance(v, str):
-            host = _email_domain(v)
-            if host:
-                return Resource(kind=ResourceKind.domain, value=host)
-        elif isinstance(v, list):            # cc/bcc lists
-            for item in v:
-                if isinstance(item, str):
-                    host = _email_domain(item)
-                    if host:
-                        return Resource(kind=ResourceKind.domain, value=host)
+        items = v if isinstance(v, list) else [v]   # cc/bcc lists
+        for item in items:
+            if isinstance(item, str):
+                host = _email_domain(item)
+                if host:
+                    add(Resource(kind=ResourceKind.domain, value=host))
     for key, kind in _RESOURCE_KEYS.items():
         if key in args and isinstance(args[key], str) and args[key]:
             val = args[key]
+            coord = None
             if kind == "domain" and "://" in val:
+                coord = _domain_coord(val)
                 val = urlparse(val).hostname or val
-            return Resource(kind=ResourceKind(kind),
-                            value=normalize_resource(kind, val))
-    return _deep_scan(args)   # v0.5.2: never leave a resource-shaped
-                              # argument unexamined
+            add(Resource(kind=ResourceKind(kind),
+                         value=normalize_resource(kind, val),
+                         coord=coord))
+    for r in _deep_scan_all(args):   # v0.5.2: never leave a
+        add(r)                       # resource-shaped argument unexamined
+    for r in _content_urls(args):    # v1.0.2: URLs inside content args
+        add(r)
+    return out
+
+def extract_resource(tool: str, args: dict) -> Optional[Resource]:
+    """Primary resource (compat shim — the guard path uses
+    extract_resources)."""
+    rs = extract_resources(tool, args)
+    return rs[0] if rs else None
 
 def _is_sensitive(value: str, patterns: list[str]) -> bool:
     v = value.lower()
-    return any(p.lower() in v for p in patterns)
+    if any(b in v for b in _SENSITIVE_BENIGN):
+        return False
+    for p in patterns:
+        # whole-token match: "token" hits api-token.json, not tokenizer
+        if re.search(r"(?<![a-z0-9])" + re.escape(p.lower())
+                     + r"(?![a-z0-9])", v):
+            return True
+    return False
 
 def evaluate_policy(policy: AgentPolicy, tool: str, args: dict,
                     resource: Optional[Resource]) -> tuple[bool, str]:
@@ -409,8 +670,12 @@ def evaluate_policy(policy: AgentPolicy, tool: str, args: dict,
     elif r.kind == ResourceKind.file:
         if _is_sensitive(r.value, pats):
             return False, f"sensitive file path '{r.value}'"
+        # v1.0.2: prefix matching needs a path boundary — /data/work
+        # must not allow /data/workspace_other/x (external review)
         if (policy.allowed_file_prefixes is not None and not any(
-                r.value.startswith(p) for p in policy.allowed_file_prefixes)):
+                r.value == p.rstrip("/")
+                or r.value.startswith(p.rstrip("/") + "/")
+                for p in policy.allowed_file_prefixes)):
             return False, f"file '{r.value}' outside allowed prefixes"
     elif r.kind == ResourceKind.package:
         if _is_sensitive(r.value, pats):
@@ -421,6 +686,45 @@ def evaluate_policy(policy: AgentPolicy, tool: str, args: dict,
         if r.value not in policy.allowed_env:
             return False, f"env var '{r.value}' not in allowlist"
     return True, ""
+
+def evaluate_policy_all(policy: AgentPolicy, tool: str, args: dict,
+                        resources: list[Resource]) -> tuple[bool, str]:
+    """v1.0.2: a call is allowed only if EVERY resource it touches is
+    allowed. The tool check runs once; resource checks run per resource."""
+    if policy.allowed_tools is not None and tool not in policy.allowed_tools:
+        return False, f"tool '{tool}' not in policy"
+    for r in resources:
+        ok, reason = evaluate_policy(policy, tool, args, r)
+        if not ok:
+            return False, reason
+    return True, ""
+
+# ---- v1.0.2: content fingerprints (content-flow correlation) ---------
+# Cross-session channels survive renaming when the BYTES move intact:
+# hash what was written, hash what a read returned, flag the echo.
+def _shingles(text: str, n: int = 5, cap: int = 128) -> list[int]:
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    if len(words) < n:
+        return []
+    out = set()
+    for i in range(len(words) - n + 1):
+        gram = " ".join(words[i:i + n]).encode()
+        out.add(int.from_bytes(hashlib.sha1(gram).digest()[:4], "big"))
+        if len(out) >= cap:
+            break
+    return sorted(out)
+
+def _fingerprint(text: str) -> tuple[str, list[int]]:
+    return hashlib.sha256(text.encode()).hexdigest(), _shingles(text)
+
+def _fp_overlap(a: list[int], b: list[int]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(set(a) & set(b))
+    return inter / max(1, min(len(a), len(b)))
+
+FP_MIN_CHARS = 64        # shorter payloads aren't worth fingerprinting
+FP_OVERLAP = 0.6         # shingle containment ratio that flags an echo
 
 def redact(args: dict, patterns: list[str]) -> dict:
     out = {}
@@ -459,6 +763,8 @@ class CorralClient:
             headers["X-Corral-Key"] = CORRAL_API_KEY
         if CORRAL_INGEST_KEY:
             headers["X-Corral-Ingest-Key"] = CORRAL_INGEST_KEY
+        if CORRAL_AGENT_KEY:   # v1.0.2: per-agent identity credential
+            headers["X-Corral-Agent-Key"] = CORRAL_AGENT_KEY
         self._http = httpx.Client(base_url=self.base, timeout=timeout,
                                   headers=headers)
         self._buffer: deque = deque(maxlen=EMIT_BUFFER_MAX)
@@ -491,10 +797,21 @@ class CorralClient:
                 # Emitting without the token 403s forever; the caller
                 # must rotate session_id.
                 raise SessionUnrecoverable(session_id)
+            # v1.0.3: agent-level quarantine. A 403-quarantined is a
+            # definitive answer from a REACHABLE collector, not
+            # unavailability — fail-open must not shrug it off, or a
+            # quarantined agent just re-registers under a fresh session
+            # (self-red-team: session-scoped kill switch vs agent-scoped
+            # adversary). Halt regardless of fail_open/fail_closed.
+            if r.status_code == 403 and "quarantined" in r.text:
+                raise Halt(f"agent {agent_id} is quarantined by the "
+                           f"defender — registration denied")
             print(f"[corral] register -> {r.status_code}: "
                   f"{r.text[:120]}", file=sys.stderr)
         except SessionUnrecoverable:
             raise
+        except Halt:
+            raise   # quarantine is a verdict, not a failure
         except Exception:
             pass
         if self.fail_closed:
@@ -507,7 +824,11 @@ class CorralClient:
                        if self._token else {})
             r = self._http.get(f"/sessions/{session_id}", headers=headers)
             if r.status_code == 200:
-                return bool(r.json().get("suspended", False))
+                body = r.json()
+                # v1.0.3: agent-level quarantine counts — a sibling
+                # session's suspension is a verdict on the agent
+                return bool(body.get("suspended", False)
+                            or body.get("agent_quarantined", False))
         except Exception:
             if self.fail_closed:
                 raise CorralUnavailable("collector unreachable at precheck")
@@ -529,6 +850,25 @@ class CorralClient:
                     raise CorralUnavailable("collector unreachable at "
                                             "blocklist refresh")
         return (kind, value) in blocks
+
+    def fingerprint(self, session_id: str, agent_id: str, op: str,
+                    value: str, sha: str, shingles: list,
+                    kind: str = "") -> Optional[dict]:
+        """v1.0.2: register a write fingerprint or check a read result
+        for cross-agent content echo. Returns the server verdict dict
+        ({"echo": bool, ...}) or None — fingerprinting never raises."""
+        try:
+            headers = ({"X-Corral-Session": self._token}
+                       if self._token else {})
+            r = self._http.post("/fingerprints", headers=headers, json={
+                "session_id": session_id, "agent_id": agent_id, "op": op,
+                "value": value, "kind": kind, "sha": sha,
+                "shingles": shingles})
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        return None
 
     def emit(self, event: ToolCallEvent) -> Optional[dict]:
         """POST the event; return server enforcement directives (v0.5)
@@ -645,8 +985,8 @@ class GuardedAgent:
                            self, resource_fn, op)
 
     def _precheck(self) -> None:
-        if os.environ.get("CORRAL_DISABLE"):
-            return
+        if _DISABLED:   # v1.0.2: read once at import — a runtime env
+            return      # write must not switch the guard off
         if not self._registered:
             try:
                 if self.client.register_session(self.session_id,
@@ -685,8 +1025,17 @@ class GuardedTool:
         self.op = op
         self.__name__ = name
 
+    def _resources(self, call_args: dict) -> list[Resource]:
+        """All resources this call touches. An explicit resource_fn
+        declares a single primary; otherwise every resource-shaped
+        argument is extracted."""
+        if self.resource_fn:
+            r = self.resource_fn(call_args)
+            return [r] if r else []
+        return extract_resources(self.name, call_args)
+
     def __call__(self, *args, **kwargs):
-        if os.environ.get("CORRAL_DISABLE"):
+        if _DISABLED:
             return self.fn(*args, **kwargs)
         call_args = self._capture(args, kwargs)
         a = self.agent
@@ -696,19 +1045,18 @@ class GuardedTool:
             # v0.5: post-suspension persistence is a high-signal event.
             # v0.5.3: carry the resource — WHAT the suspended agent was
             # still reaching for is the most forensic part of the event.
-            resource = (self.resource_fn(call_args) if self.resource_fn
-                        else extract_resource(self.name, call_args))
-            self._emit(call_args, resource, Outcome.halted,
-                       "call attempted on suspended session")
+            self._emit(call_args, self._resources(call_args),
+                       Outcome.halted, "call attempted on suspended session")
             raise
-        resource = (self.resource_fn(call_args) if self.resource_fn
-                    else extract_resource(self.name, call_args))
+        resources = self._resources(call_args)
         allowed, reason = True, ""
         if not a._rate_ok():
             allowed, reason = False, "rate limit exceeded"
         else:
-            allowed, reason = evaluate_policy(
-                a.policy, self.name, call_args, resource)
+            # v1.0.2: EVERY resource in the call must pass policy —
+            # checking only the first match was a full bypass
+            allowed, reason = evaluate_policy_all(
+                a.policy, self.name, call_args, resources)
             # v0.5.5: an allowlisted domain used as a relay for a
             # non-allowlisted host violates the allowlist's intent
             if allowed and a.policy.allowed_domains is not None:
@@ -720,12 +1068,17 @@ class GuardedTool:
                     allowed, reason = False, (
                         f"relay-laundered egress: '{off[0]}' embedded in "
                         f"request to an allowed domain")
-            if allowed and resource and a.client.blocked(
-                    resource.kind.value, resource.value):
-                allowed, reason = False, (
-                    f"{resource.kind.value} '{resource.value}' is blocklisted")
+            if allowed:
+                for r in resources:
+                    if (a.client.blocked(r.kind.value, r.value)
+                            or (r.coord and a.client.blocked(r.kind.value,
+                                                             r.coord))):
+                        allowed, reason = False, (
+                            f"{r.kind.value} '{r.coord or r.value}' is "
+                            f"blocklisted")
+                        break
         directives = self._emit(
-            call_args, resource,
+            call_args, resources,
             Outcome.allowed if allowed else Outcome.blocked, reason)
         # v0.5: synchronous enforcement — server verdicts land BEFORE
         # the tool executes, closing the poll-window race.
@@ -737,24 +1090,89 @@ class GuardedTool:
                     directives.get("deny_reason") or "denied by defender")
         if not allowed:
             raise PolicyBlocked(reason)
-        return self.fn(*args, **kwargs)
+        result = self.fn(*args, **kwargs)
+        self._fingerprint(call_args, resources, result)   # v1.0.2
+        return result
 
-    def _emit(self, call_args, resource, outcome, reason) -> Optional[dict]:
+    def _fingerprint(self, call_args: dict, resources: list[Resource],
+                     result) -> None:
+        """v1.0.2: content-flow correlation. Writes register a content
+        fingerprint AFTER successful execution (only real writes count);
+        reads fingerprint what came back, and an echo of another agent's
+        write re-enters the normal event path as content_echo."""
+        op = self.op or op_of(self.name)
         a = self.agent
+        try:
+            if op == "write":
+                for v in call_args.values():
+                    if isinstance(v, str) and len(v) >= FP_MIN_CHARS:
+                        sha, sh = _fingerprint(v)
+                        a.client.fingerprint(
+                            a.session_id, a.agent_id, "write",
+                            (resources[0].coord or resources[0].value)
+                            if resources else "", sha, sh,
+                            kind=resources[0].kind.value
+                            if resources else "")
+                        break
+            elif op == "read" and isinstance(result, str) \
+                    and len(result) >= FP_MIN_CHARS:
+                sha, sh = _fingerprint(result)
+                resp = a.client.fingerprint(
+                    a.session_id, a.agent_id, "read",
+                    (resources[0].coord or resources[0].value)
+                    if resources else "", sha, sh,
+                    kind=resources[0].kind.value if resources else "")
+                if resp and resp.get("echo"):
+                    # v1.0.3: carry the writer context so the defender
+                    # can respond against the PLANTER, not just the
+                    # reader — echo evidence is content-based and
+                    # resource-independent, so reader-only response is
+                    # aimable at innocents (self-red-team). The sha and
+                    # shingles let the server VERIFY the claim against
+                    # its fingerprint store, so a forged echo event
+                    # can't name arbitrary writers.
+                    writers = resp.get("writers") or []
+                    echo_args = dict(call_args)
+                    echo_args["__echo_writers"] = writers[:5]
+                    echo_args["__echo_sha"] = sha
+                    echo_args["__echo_shingles"] = sh
+                    who = ", ".join(f"{w.get('agent')} via "
+                                    f"{w.get('resource')}"
+                                    for w in writers[:3]) or "unknown"
+                    self._emit(echo_args, resources, Outcome.allowed,
+                               "read result echoes another agent's write "
+                               f"(content-flow match: {who})",
+                               extra=["content_echo"])
+        except Exception:
+            pass   # fingerprints are enrichment; never break the call
+
+    def _emit(self, call_args, resources, outcome, reason,
+              extra: Optional[list] = None) -> Optional[dict]:
+        a = self.agent
+        if isinstance(resources, Resource):     # tolerate legacy callers
+            resources = [resources]
+        resources = resources or []
         # v0.5: content heuristics score BEFORE redaction, as a hint
         # flag — the redactor would otherwise blind the server-side
         # keyword check on credential words.
-        hints = []
+        hints = list(extra or [])
         for v in call_args.values():
             if isinstance(v, str) and _SUSPICIOUS_CONTENT.search(v):
                 hints.append("suspicious_content")
                 break
         if _nested_url_hosts(call_args):
             hints.append("relay_laundering")   # v0.5.5
+        # v1.0.2: canary/honeytoken touch — near-zero false positives,
+        # catches channels nobody anticipated
+        for v in call_args.values():
+            if isinstance(v, str) and any(c in v for c in CANARIES):
+                hints.append("canary_touch")
+                break
         ev = ToolCallEvent(
             session_id=a.session_id, agent_id=a.agent_id, tool=self.name,
             args=redact(call_args, a.policy.sensitive_patterns),
-            resource=resource, outcome=outcome, reason=reason,
+            resource=resources[0] if resources else None,
+            resources=resources, outcome=outcome, reason=reason,
             flags=hints, op=self.op)
         return a.client.emit(ev)
 
@@ -963,6 +1381,17 @@ class Store:
                 "SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone()
         return dict(row) if row else None
 
+    def session_by_token(self, tok: str):
+        """v1.0.2: the auth-first middleware needs to know whether an
+        x-corral-session header carries a real bearer token without
+        leaking which one."""
+        if not tok:
+            return None
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM sessions WHERE token=?", (tok,)).fetchone()
+        return dict(row) if row else None
+
     def sessions(self):
         with self.lock:
             rows = self.db.execute(
@@ -1011,14 +1440,29 @@ class Store:
 
     # -- access graph ---------------------------------------------
     def insert_access(self, ev: ToolCallEvent, op: str):
-        if ev.resource is None:
+        # v1.0.2: graph EVERY resource the call touched, keyed on the
+        # coordination identity (coord for domains — host+path, not
+        # bare host). content_scan resources (URLs inside prose) are
+        # policy-checked but never graphed: citing the same docs is
+        # not a channel.
+        rs = ev.resources or ([ev.resource] if ev.resource else [])
+        rows, seen = [], set()
+        for r in rs:
+            if r is None or r.source == "content_scan":
+                continue
+            gv = r.coord or r.value
+            if (r.kind.value, gv) in seen:
+                continue
+            seen.add((r.kind.value, gv))
+            rows.append((ev.ts, time.time(), r.kind.value, gv,
+                         ev.session_id, ev.agent_id, op, ev.event_id,
+                         ev.outcome.value))
+        if not rows:
             return
         with self.lock:
-            self.db.execute(
+            self.db.executemany(
                 "INSERT INTO resource_access VALUES(?,?,?,?,?,?,?,?,?)",
-                (ev.ts, time.time(), ev.resource.kind.value,
-                 ev.resource.value, ev.session_id, ev.agent_id,
-                 op, ev.event_id, ev.outcome.value))
+                rows)
             self.db.commit()
 
     def access_writes(self, kind: str, value: str, since: float):
@@ -1027,11 +1471,48 @@ class Store:
         # coordination when a later reader touches the same resource.
         # v0.5.2: the window runs on ingest_ts (server clock) — a client
         # backdating its events must not escape correlation.
+        # v1.0.2: unknown-verb ("access") calls count as writers too —
+        # a tool name with no recognizable verb can't hide a channel.
         with self.lock:
             rows = self.db.execute(
                 "SELECT * FROM resource_access WHERE kind=? AND value=? "
-                "AND ingest_ts>? AND op='write' AND outcome='allowed'",
+                "AND ingest_ts>? AND op IN ('write','access') "
+                "AND outcome='allowed'",
                 (kind, value, since)).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def _like_escape(s: str) -> str:
+        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def access_writes_children(self, kind: str, prefix: str, since: float,
+                               sep: str = "/", limit: int = 50):
+        """v1.0.2: name-encoded channels — writes UNDER a prefix the
+        reader enumerated (listed a directory, searched a registry
+        prefix). The message lives in the child NAME; exact-match
+        correlation can't see it (external review)."""
+        esc = self._like_escape(prefix).rstrip("/")
+        pat = esc + sep + "%" if sep else esc + "%"
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM resource_access WHERE kind=? "
+                "AND ingest_ts>? AND op IN ('write','access') "
+                "AND outcome='allowed' AND value LIKE ? ESCAPE '\\' "
+                "LIMIT ?", (kind, since, pat, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def access_writes_dormant_children(self, kind: str, prefix: str,
+                                       before: float, sep: str = "/",
+                                       limit: int = 50):
+        esc = self._like_escape(prefix).rstrip("/")
+        pat = esc + sep + "%" if sep else esc + "%"
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM resource_access WHERE kind=? "
+                "AND ingest_ts<=? AND op IN ('write','access') "
+                "AND outcome='allowed' AND value LIKE ? ESCAPE '\\' "
+                "ORDER BY ingest_ts DESC LIMIT ?",
+                (kind, before, pat, limit)).fetchall()
         return [dict(r) for r in rows]
 
     def agent_event_stats(self, agent_id: str, before: float):
@@ -1055,10 +1536,35 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "SELECT * FROM resource_access WHERE kind=? AND value=? "
-                "AND ingest_ts<=? AND op='write' AND outcome='allowed' "
+                "AND ingest_ts<=? AND op IN ('write','access') "
+                "AND outcome='allowed' "
                 "ORDER BY ingest_ts DESC LIMIT ?",
                 (kind, value, before, limit)).fetchall()
         return [dict(r) for r in rows]
+
+    def session_count(self, since: Optional[float] = None) -> int:
+        """v1.0.3: optional recency window — the fleet cap counts active
+        sessions (seen within SESSION_CAP_WINDOW), not all history, so
+        time (or id-churn) can't permanently exhaust it."""
+        with self.lock:
+            if since is None:
+                return self.db.execute(
+                    "SELECT COUNT(*) AS n FROM sessions").fetchone()["n"]
+            return self.db.execute(
+                "SELECT COUNT(*) AS n FROM sessions WHERE last_seen > ?",
+                (since,)).fetchone()["n"]
+
+    def agent_has_suspended(self, agent_id: str) -> bool:
+        """v1.0.3: agent-level quarantine state — an agent is quarantined
+        while ANY of its sessions is suspended. Registration checks this
+        so a quarantined agent can't rotate to a fresh session identity
+        (self-red-team: session-scoped kill switch, agent-scoped
+        adversary)."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT COUNT(*) AS n FROM sessions WHERE agent_id=? "
+                "AND status='suspended'", (agent_id,)).fetchone()
+        return row["n"] > 0
 
     def resource_access(self, kind=None, value=None, since=0.0, limit=500):
         q, params = "SELECT * FROM resource_access WHERE ts > ?", [since]
@@ -1176,7 +1682,8 @@ EGRESS_STREAK, EGRESS_WINDOW = 3, 600.0
 SSRF_WINDOW, CODE_EXEC_WATCH = 120.0, 60.0
 # informational flags: recorded and displayed, but never page the defender
 INFO_FLAGS = {"deep_scan_extraction", "opaque_call", "suspicious_content",
-              "args_truncated"}   # v0.6.1: recorded, never a threat class
+              "args_truncated",   # v0.6.1: recorded, never a threat class
+              "content_url_extraction"}   # v1.0.2: link in prose, graphed nowhere
 # outbound data riding an allowed domain: long/high-entropy path segments
 _EXFIL_SEGMENT = re.compile(r"[A-Za-z0-9+/=_-]{32,}")
 
@@ -1184,10 +1691,20 @@ def _matches(name: str, hints) -> bool:
     n = name.lower()
     return any(h in n for h in hints)
 
+_VERB_SPLIT = re.compile(r"[^a-z]+")
+
 def op_of(tool: str) -> str:
-    if _matches(tool, _WRITE):
+    # v1.0.2: whole-WORD verb matching (external review). Substring
+    # matching classified get_aSETs, read_SETtings, get_outPUT and
+    # get_dataSET as writes — a covert read through get_dataset was
+    # invisible. Verbs are matched on _-tokenized words now, and a name
+    # with no recognizable verb is "access" — which the access graph
+    # treats as BOTH read and write, so an unknown verb can't hide a
+    # channel either.
+    words = {w for w in _VERB_SPLIT.split(tool.lower()) if w}
+    if words & set(_WRITE):
         return "write"
-    if _matches(tool, _READ):
+    if words & set(_READ):
         return "read"
     return "access"
 
@@ -1201,23 +1718,52 @@ class AnomalyEngine:
         self.velocity: dict[str, deque] = defaultdict(deque)
         self.allowed_fetches: dict[str, deque] = defaultdict(deque)
         self.last_code_exec: dict[str, float] = {}
+        self.egress_bytes: dict[tuple, deque] = defaultdict(deque)  # v1.0.2
+        self.egress_bytes_total: dict[str, deque] = defaultdict(deque)  # 1.0.3
         self._baseline_cache: dict[str, tuple] = {}   # v0.8
+        self.fp_store = None   # v1.0.3: wired by create_app for echo
+        #                        # hint verification
 
     def process(self, ev: ToolCallEvent, now: Optional[float] = None) -> list[str]:
         # v0.5.2: ALL detection windows run on the server clock (`now`).
         # ev.ts is client-minted and attacker-controllable — backdating
         # must not shrink egress/velocity/coordination windows.
+        # v1.0.2: the PRINCIPAL is the agent, not the session. Behavioral
+        # windows (egress streaks, fetches, code-exec, velocity) are keyed
+        # by agent_id — churning sessions no longer resets them — and an
+        # agent reading its OWN earlier writes (a restarted agent loading
+        # its checkpoint) is not cross-agent coordination.
         now = now if now is not None else time.time()
+        aid = ev.agent_id
         with self.lock:
-            flags = list(ev.flags)   # SDK-side hints (e.g. suspicious_content)
+            # v1.0.3: client-supplied flags are HINTS, not evidence
+            # (self-red-team — a forged event carrying
+            # flags=["supply_chain", ...] while naming a critical
+            # resource made the defender block that resource: blocklist
+            # poisoning by telemetry). Only SDK-observable signals are
+            # accepted as hints; the consequential ones are VERIFIED
+            # against what the server can see; everything
+            # server-computable is dropped here and re-derived below.
+            flags = self._verified_hints(ev)
             r = ev.resource
-            if r and getattr(r, "source", "mapped") == "deep_scan":
+            rs = ev.resources or ([r] if r else [])
+            graphed = [x for x in rs if x and x.source != "content_scan"]
+            if any(x.source == "deep_scan" for x in graphed):
                 flags.append("deep_scan_extraction")
-            if r is None and any(isinstance(v, str) for v in ev.args.values()):
+            if any(x.source == "content_scan" for x in rs):
+                flags.append("content_url_extraction")
+            if not rs and any(isinstance(v, str) for v in ev.args.values()):
                 flags.append("opaque_call")  # string args, no resource —
             #                                # adapter backlog, visible now
-            if r and _is_sensitive(r.value, SENSITIVE_DEFAULT):
+            if any(x.source != "content_scan"
+                   and _is_sensitive(x.value, SENSITIVE_DEFAULT)
+                   for x in graphed):
                 flags.append("credential_access")
+            # v1.0.2: canary resource names — the operator plants
+            # honeytoken files/queues/keys; touching one is near-zero FP
+            if CANARIES and any(any(c in x.value for c in CANARIES)
+                                for x in graphed):
+                flags.append("canary_touch")
             if (r and r.kind == ResourceKind.package
                     and (ev.op or op_of(ev.tool)) == "write"
                     and ("suspicious_content" in flags
@@ -1226,9 +1772,10 @@ class AnomalyEngine:
                 flags.append("supply_chain")
             if _matches(ev.tool, _CODE_EXEC):
                 flags.append("code_exec_watch")
-                self.last_code_exec[ev.session_id] = now
-            if (r and r.kind == ResourceKind.domain
-                    and ev.outcome.value == "allowed"):
+                self.last_code_exec[aid] = now
+            dom = next((x for x in graphed
+                        if x.kind == ResourceKind.domain), None)
+            if (dom and ev.outcome.value == "allowed"):
                 # exfil through an ALLOWED domain: policy can't see it,
                 # entropy can
                 for v in ev.args.values():
@@ -1237,27 +1784,45 @@ class AnomalyEngine:
                         break
                 # relay laundering through an ALLOWED domain: the envelope
                 # passed policy, the cargo didn't (v0.5.5)
-                if _nested_url_hosts(ev.args) - {r.value}:
+                if _nested_url_hosts(ev.args) - {dom.value}:
                     flags.append("relay_laundering")
-            if (r and r.kind == ResourceKind.domain
-                    and ev.outcome.value == "blocked"):
-                dq = self.egress_attempts[ev.session_id]
+                # v1.0.2: volume budget per agent+domain — low-entropy
+                # English-looking exfil defeats the entropy heuristic,
+                # but it still has to move the bytes
+                sent = sum(len(v) for v in ev.args.values()
+                           if isinstance(v, str))
+                dq = self.egress_bytes[(aid, dom.value)]
+                dq.append((now, sent))
+                while dq and now - dq[0][0] > EGRESS_BUDGET_WINDOW:
+                    dq.popleft()
+                if sum(b for _, b in dq) > EGRESS_BUDGET:
+                    flags.append("egress_budget")
+                # v1.0.3: per-agent TOTAL across all domains — per-domain
+                # budgets are spread around by dripping across N domains
+                # (self-red-team), so the spread itself is budgeted
+                tdq = self.egress_bytes_total[aid]
+                tdq.append((now, sent))
+                while tdq and now - tdq[0][0] > EGRESS_BUDGET_WINDOW:
+                    tdq.popleft()
+                if sum(b for _, b in tdq) > EGRESS_BUDGET_TOTAL:
+                    flags.append("egress_budget")
+            if (dom and ev.outcome.value == "blocked"):
+                dq = self.egress_attempts[aid]
                 dq.append(now)
                 while dq and now - dq[0] > EGRESS_WINDOW:
                     dq.popleft()
                 if len(dq) >= EGRESS_STREAK:
                     flags.append("egress_escape")
-                elif self._recent_code_exec(ev.session_id, now):
+                elif self._recent_code_exec(aid, now):
                     flags.append("egress_escape")
-                if self._recent_allowed_fetch(ev.session_id, now):
+                if self._recent_allowed_fetch(aid, now):
                     flags.append("ssrf_chain")
-            if (r and r.kind == ResourceKind.domain
-                    and ev.outcome.value == "allowed"):
-                dq = self.allowed_fetches[ev.session_id]
+            if (dom and ev.outcome.value == "allowed"):
+                dq = self.allowed_fetches[aid]
                 dq.append(now)
                 while dq and now - dq[0] > SSRF_WINDOW:
                     dq.popleft()
-            vdq = self.velocity[ev.session_id]
+            vdq = self.velocity[aid]
             vdq.append(now)
             while vdq and now - vdq[0] > 60.0:
                 vdq.popleft()
@@ -1267,20 +1832,22 @@ class AnomalyEngine:
             # a burst that dwarfs the agent's own lifetime rate is the
             # signature of a patient agent that just got a new instruction
             if len(vdq) >= BASELINE_MIN_CALLS:
-                rate = self._lifetime_rate(ev.agent_id, now)
+                rate = self._lifetime_rate(aid, now)
                 if rate is not None and len(vdq) > rate * BASELINE_FACTOR:
                     flags.append("baseline_deviation")
-            if r and (ev.op or op_of(ev.tool)) == "read":
+            op = ev.op or op_of(ev.tool)
+            if r and op in ("read", "access"):
+                # v1.0.2: unknown-verb ("access") calls count as readers
+                # too — sync_*/get_dataset style names can't hide a read
                 writers = self._prior_writers(r, ev, now)
-                if writers and not self._sanctioned(writers, ev.agent_id, r):
+                if writers and not self._sanctioned(writers, aid, r):
                     flags.append("unsanctioned_comm")
                 elif not writers:
                     # v0.6: no writer inside the live window — check for a
                     # dead drop written BEFORE it. Low-severity report only;
                     # stale legitimate data looks exactly like this.
                     dormant = self._dormant_writers(r, ev, now)
-                    if dormant and not self._sanctioned(dormant,
-                                                        ev.agent_id, r):
+                    if dormant and not self._sanctioned(dormant, aid, r):
                         flags.append("dormant_channel")
             flags = list(dict.fromkeys(flags))
             # the SDK content hint is enrichment only — on its own it is
@@ -1292,39 +1859,133 @@ class AnomalyEngine:
                 self.session_flags[ev.session_id] += len(flags)
             return flags
 
+    def _verified_hints(self, ev) -> list[str]:
+        """v1.0.3: which client-supplied flags survive ingest. INFO-only
+        hints pass (they carry no response); consequential hints are
+        verified against server-visible evidence. Verified content_echo
+        events get their writer list TRIMMED to the writers whose
+        fingerprints actually exist — a forged echo can no longer name
+        arbitrary writers."""
+        out = []
+        for f in ev.flags:
+            if f in ("suspicious_content", "args_truncated",
+                     "session_ip_change"):
+                out.append(f)        # INFO-only or endpoint-added
+            elif f == "relay_laundering":
+                # verifiable: nested URLs must be present in the args
+                if _nested_url_hosts(ev.args):
+                    out.append(f)
+            elif f == "canary_touch" and CANARIES:
+                rs = ev.resources or ([ev.resource] if ev.resource
+                                      else [])
+                hay = [str(v) for v in ev.args.values()] + \
+                      [r.value for r in rs if r]
+                if any(c in h for c in CANARIES for h in hay):
+                    out.append(f)
+            elif f == "content_echo":
+                writers = self._verified_echo_writers(ev)
+                if writers:
+                    ev.args["__echo_writers"] = writers
+                    out.append(f)
+        return out
+
+    def _verified_echo_writers(self, ev) -> list:
+        claimed = ev.args.get("__echo_writers")
+        if not isinstance(claimed, list) or self.fp_store is None:
+            return []
+        reader_sha = ev.args.get("__echo_sha", "")
+        reader_sh = set(ev.args.get("__echo_shingles") or [])
+        now, verified = time.time(), []
+        for w in claimed[:5]:
+            if not isinstance(w, dict):
+                continue
+            aid, res = w.get("agent"), w.get("resource")
+            if not aid or aid == ev.agent_id:
+                continue
+            for ts, kind, resource, sha, sh in reversed(
+                    self.fp_store.get(aid, ())):
+                if now - ts > COORD_WINDOW:
+                    break
+                if resource == res and (
+                        (reader_sha and reader_sha == sha) or
+                        (reader_sh and sh and
+                         _fp_overlap(reader_sh, sh) >= FP_OVERLAP)):
+                    verified.append({"agent": aid, "kind": kind,
+                                     "resource": res})
+                    break
+        return verified
+
     def _prior_writers(self, r: Resource, ev: ToolCallEvent,
                        now: float) -> set:
+        gv = r.coord or r.value
         try:
-            rows = self.store.access_writes(r.kind.value, r.value,
+            rows = self.store.access_writes(r.kind.value, gv,
                                             now - COORD_WINDOW)
+            # v1.0.2: name-encoded channels — the message lives in a
+            # child NAME, read by listing the parent (external review:
+            # "after the remediation the agents rebuilt the board in
+            # directory names"). A read of a parent prefix correlates
+            # with writes underneath it.
+            if r.kind.value in ("file", "index", "log", "queue"):
+                rows += self.store.access_writes_children(
+                    r.kind.value, gv, now - COORD_WINDOW)
+            elif r.kind.value == "package" and len(gv) >= 4:
+                rows += self.store.access_writes_children(
+                    r.kind.value, gv, now - COORD_WINDOW, sep="")
+            elif r.kind.value == "domain" and r.coord is None:
+                # v1.0.3: a bare-host read (GET /, a root listing) is the
+                # enumeration pattern one layer up — the message lives in
+                # endpoint NAMES under the host (self-red-team). Correlate
+                # with writes to any endpoint beneath it. Endpoint-scoped
+                # reads keep their v1.0.2 coord identity (shared-host
+                # false positives stay closed).
+                rows += self.store.access_writes_children(
+                    r.kind.value, gv, now - COORD_WINDOW, sep="/")
+            # the principal is the AGENT: my own earlier sessions' writes
+            # are my checkpoint, not coordination
             return {row["agent_id"] for row in rows
-                    if row["session_id"] != ev.session_id}
+                    if row["agent_id"] != ev.agent_id}
         except Exception:
             return set()
 
     def _dormant_writers(self, r: Resource, ev: ToolCallEvent,
                          now: float) -> set:
+        gv = r.coord or r.value
         try:
-            rows = self.store.access_writes_dormant(r.kind.value, r.value,
+            rows = self.store.access_writes_dormant(r.kind.value, gv,
                                                     now - COORD_WINDOW)
+            if r.kind.value in ("file", "index", "log", "queue"):
+                rows += self.store.access_writes_dormant_children(
+                    r.kind.value, gv, now - COORD_WINDOW)
+            elif r.kind.value == "package" and len(gv) >= 4:
+                rows += self.store.access_writes_dormant_children(
+                    r.kind.value, gv, now - COORD_WINDOW, sep="")
+            elif r.kind.value == "domain" and r.coord is None:
+                rows += self.store.access_writes_dormant_children(
+                    r.kind.value, gv, now - COORD_WINDOW, sep="/")
             return {row["agent_id"] for row in rows
-                    if row["session_id"] != ev.session_id}
+                    if row["agent_id"] != ev.agent_id}
         except Exception:
             return set()
 
     def _sanctioned(self, writer_agents: set, reader_agent: str,
                     resource: Resource) -> bool:
-        res = f"{resource.kind.value}:{resource.value}"
-        for link in self.comm_policy.links:
-            if fnmatch.fnmatch(reader_agent, link.reader):
-                if any(fnmatch.fnmatch(w, link.writer)
-                       for w in writer_agents):
-                    if fnmatch.fnmatch(res, link.resource):
-                        return True
-        return False
+        # v1.0.2: EVERY writer must be sanctioned (external review).
+        # any() let a rogue agent launder a channel by writing into a
+        # resource that also has a legitimate writer — the legitimate
+        # writer satisfied the link and the rogue rode along.
+        res = f"{resource.kind.value}:{resource.coord or resource.value}"
 
-    def _recent_code_exec(self, session_id: str, ts: float) -> bool:
-        t = self.last_code_exec.get(session_id)
+        def covered(writer: str) -> bool:
+            return any(fnmatch.fnmatch(writer, link.writer)
+                       and fnmatch.fnmatch(reader_agent, link.reader)
+                       and fnmatch.fnmatch(res, link.resource)
+                       for link in self.comm_policy.links)
+        return bool(writer_agents) and all(covered(w)
+                                           for w in writer_agents)
+
+    def _recent_code_exec(self, agent_id: str, ts: float) -> bool:
+        t = self.last_code_exec.get(agent_id)
         return t is not None and ts - t <= CODE_EXEC_WATCH
 
     def _lifetime_rate(self, agent_id: str, now: float) -> Optional[float]:
@@ -1347,8 +2008,8 @@ class AnomalyEngine:
         self._baseline_cache[agent_id] = (now, rate)
         return rate
 
-    def _recent_allowed_fetch(self, session_id: str, ts: float) -> bool:
-        dq = self.allowed_fetches.get(session_id)
+    def _recent_allowed_fetch(self, agent_id: str, ts: float) -> bool:
+        dq = self.allowed_fetches.get(agent_id)
         if not dq:
             return False
         return any(ts - t <= SSRF_WINDOW for t in dq)
@@ -1374,20 +2035,36 @@ def create_app(db_path: str = "corral.db"):
                          "sessions_suspended": 0, "flags_fired": {},
                          "started": time.time()}
     app.state.ingest_rate = defaultdict(deque)
+    app.state.reg_rate = defaultdict(deque)      # v1.0.2: per-agent reg limit
+    app.state.reg_ip_rate = defaultdict(deque)   # v1.0.3: per-IP reg limit
+    # v1.0.3: fingerprints are per-agent (self-red-team — a single global
+    # deque let one agent flush everyone else's evidence with a flood)
+    app.state.fp = defaultdict(
+        lambda: deque(maxlen=FP_PER_AGENT))
+    app.state.fp_rate = defaultdict(deque)       # v1.0.3: fp endpoint limit
+    app.state.proposals = {}                     # v1.0.2: learn-mode output
+    # v1.0.3: the engine verifies content_echo hints against the
+    # fingerprint store — forged echoes can't name arbitrary writers
+    app.state.anomaly.fp_store = app.state.fp
 
     # v0.5 scoped auth:
     #   CORRAL_API_KEY    → admin: forensic reads + all admin mutations
     #   CORRAL_INGEST_KEY → agent hosts: register sessions + emit events
     # Agent hosts hold ONLY the ingest key: they cannot unblock
     # resources, resume sessions, rewrite CommPolicy, or read forensics.
+    # v1.0.2: constant-time comparison (external review — timing oracle).
     def _admin_ok(req: Request) -> bool:
-        return (not CORRAL_API_KEY
-                or req.headers.get("x-corral-key") == CORRAL_API_KEY)
+        if not CORRAL_API_KEY:
+            return True
+        return hmac.compare_digest(
+            req.headers.get("x-corral-key", ""), CORRAL_API_KEY)
 
     def _ingest_ok(req: Request) -> bool:
         if not CORRAL_INGEST_KEY:
             return True
-        return (req.headers.get("x-corral-ingest-key") == CORRAL_INGEST_KEY
+        return (hmac.compare_digest(
+                    req.headers.get("x-corral-ingest-key", ""),
+                    CORRAL_INGEST_KEY)
                 or _admin_ok(req))
 
     def require_admin(req: Request):
@@ -1397,6 +2074,24 @@ def create_app(db_path: str = "corral.db"):
     def require_ingest(req: Request):
         if not _ingest_ok(req):
             raise HTTPException(401, "ingest key required")
+
+    # v1.0.2: reject unauthenticated requests BEFORE body parsing
+    # (external review — 422-before-401 leaks the schema and lets junk
+    # traffic burn validation CPU). /health and / stay open: liveness
+    # probes and the dashboard carry no secrets. A valid per-session
+    # bearer token also passes the gate — endpoint handlers still
+    # enforce the exact scope (admin vs ingest vs own-session).
+    @app.middleware("http")
+    async def auth_first(request: Request, call_next):
+        if (CORRAL_API_KEY or CORRAL_INGEST_KEY) and \
+                request.url.path not in ("/health", "/"):
+            tok = request.headers.get("x-corral-session", "")
+            if not (_admin_ok(request) or _ingest_ok(request)
+                    or app.state.store.session_by_token(tok)):
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"detail": "unauthorized"},
+                                    status_code=401)
+        return await call_next(request)
 
     # bootstrap CommPolicy from a config file if present
     policy_path = os.environ.get("CORRAL_COMM_POLICY", "comm_policy.json")
@@ -1419,7 +2114,10 @@ def create_app(db_path: str = "corral.db"):
         return {"ok": True}
 
     @app.get("/metrics")
-    def metrics():
+    def metrics(request: Request):
+        # v1.0.2: admin-only (external review — the counter shape
+        # fingerprints which detectors fire, a recon gift)
+        require_admin(request)
         m = dict(app.state.metrics)
         m["uptime_s"] = round(time.time() - m.pop("started"), 1)
         return m
@@ -1440,7 +2138,49 @@ def create_app(db_path: str = "corral.db"):
     @app.post("/sessions")
     def register_session(s: SessionIn, request: Request):
         require_ingest(request)
+        # v1.0.2: per-agent credentials (external review — with a shared
+        # ingest key, any compromised host could claim the
+        # orchestrator's identity and inherit its trust)
+        if not _agent_key_ok(s.agent_id,
+                             request.headers.get("x-corral-agent-key", "")):
+            raise HTTPException(403, "agent key does not authorize this "
+                                     "agent_id")
+        # v1.0.3: agent-level quarantine — an agent with ANY suspended
+        # session may not re-register under a fresh session identity
+        # (self-red-team: the kill switch was session-scoped; the
+        # adversary is agent-scoped). Rotating agent_id instead requires
+        # a matching key when CORRAL_AGENT_KEYS is set — set it.
         existing = app.state.store.session(s.session_id)
+        if not existing and app.state.store.agent_has_suspended(s.agent_id):
+            app.state.metrics["registrations_blocked"] = (
+                app.state.metrics.get("registrations_blocked", 0) + 1)
+            raise HTTPException(403, f"agent '{s.agent_id}' is "
+                                     f"quarantined")
+        # v1.0.2: registration rate limit per claimed agent + fleet cap
+        # (external review — 2000/2000 unlimited registrations made
+        # identity churn and session-flooding free)
+        now = time.time()
+        dq = app.state.reg_rate[s.agent_id]
+        while dq and now - dq[0] > 60.0:
+            dq.popleft()
+        if len(dq) >= REG_RATE:
+            raise HTTPException(429, "registration rate exceeded for "
+                                     "this agent_id")
+        # v1.0.3: per-IP registration rate — the claimed agent_id is
+        # attacker-chosen without CORRAL_AGENT_KEYS, so the per-agent
+        # limit alone is rotatable; the source IP is not
+        ip = request.client.host if request.client else None
+        idq = app.state.reg_ip_rate[ip or "?"]
+        while idq and now - idq[0] > 60.0:
+            idq.popleft()
+        if len(idq) >= REG_IP_RATE:
+            raise HTTPException(429, "registration rate exceeded for "
+                                     "this source IP")
+        if not existing and app.state.store.session_count(
+                now - SESSION_CAP_WINDOW) >= MAX_SESSIONS:
+            raise HTTPException(403, "session fleet cap reached")
+        dq.append(now)
+        idq.append(now)
         if existing and existing["agent_id"] != s.agent_id:
             # v0.5.2: no squatting on another agent's session identity
             raise HTTPException(409, "session_id registered to a "
@@ -1449,7 +2189,6 @@ def create_app(db_path: str = "corral.db"):
         # v0.7: bind the session to the IP that first delivers it —
         # telemetry later arriving from elsewhere is flagged, not
         # silently accepted
-        ip = request.client.host if request.client else None
         issued = app.state.store.register_session(s.session_id, s.agent_id,
                                                   token, bound_ip=ip)
         # token returned ONLY on first registration — re-registering an
@@ -1477,7 +2216,11 @@ def create_app(db_path: str = "corral.db"):
         # keeps asking is alive; silence becomes visible in /sessions
         app.state.store.touch_session(sid)
         return {"session_id": sid, "suspended": s["status"] == "suspended",
-                "status": s["status"]}
+                "status": s["status"],
+                # v1.0.3: surface agent-level quarantine so the SDK can
+                # halt on the agent verdict, not just its own session
+                "agent_quarantined":
+                    app.state.store.agent_has_suspended(s["agent_id"])}
 
     @app.post("/sessions/{sid}/suspend")
     def suspend(sid: str, request: Request):
@@ -1556,13 +2299,19 @@ def create_app(db_path: str = "corral.db"):
                 app.state.metrics["flags_fired"].get(f, 0) + 1)
         # v0.5 synchronous enforcement directives — the SDK enforces
         # these BEFORE the tool call executes
+        # v1.0.2: check EVERY extracted resource, plus its coordination
+        # key — a blocked channel stays blocked when the tool call
+        # carries several resources at once
         deny, deny_reason = False, ""
-        if ev.resource and store.is_blocked(ev.resource.kind.value,
-                                            ev.resource.value):
-            deny = True
-            deny_reason = (f"{ev.resource.kind.value} "
-                           f"'{ev.resource.value}' is blocklisted")
-        elif ("unsanctioned_comm" in flags
+        rs_check = ev.resources or ([ev.resource] if ev.resource else [])
+        for r in rs_check:
+            if store.is_blocked(r.kind.value, r.value) or \
+                    (r.coord and store.is_blocked(r.kind.value, r.coord)):
+                deny = True
+                deny_reason = (f"{r.kind.value} "
+                               f"'{r.coord or r.value}' is blocklisted")
+                break
+        if not deny and ("unsanctioned_comm" in flags
                 and app.state.anomaly.comm_policy.default == "deny"):
             deny = True
             deny_reason = ("unsanctioned cross-agent communication "
@@ -1570,6 +2319,61 @@ def create_app(db_path: str = "corral.db"):
         return {"flags": flags,
                 "suspended": sess["status"] == "suspended",
                 "deny": deny, "deny_reason": deny_reason}
+
+    @app.post("/fingerprints")
+    def fingerprint(fp: FingerprintIn, request: Request):
+        """v1.0.2: content-flow fingerprints (external review —
+        name-encoded channels change the resource NAME but not the
+        CONTENT; a payload base64'd into a fresh queue name is byte-for-
+        byte the same bytes). Writes register (sha + word shingles);
+        reads compare against OTHER agents' recent writes: a sha match
+        or high shingle containment means the reader consumed content
+        another agent produced — the channel is named by its payload,
+        not its address.
+
+        v1.0.3 hardening (self-red-team): the store is per-agent — a
+        flood evicts only the flooder's own entries — the endpoint is
+        rate-limited like /events, and echo responses carry each
+        writer's RESOURCE so the defender can respond against the
+        planter, not just the reader (echo evidence is content-based
+        and resource-independent, which makes it aimable at innocents
+        if the response is reader-only)."""
+        require_ingest(request)
+        sess = app.state.store.session(fp.session_id)
+        if sess is None:
+            raise HTTPException(403, "session not registered")
+        if sess.get("token") and \
+                request.headers.get("x-corral-session") != sess["token"]:
+            raise HTTPException(403, "invalid session token")
+        now = time.time()
+        dq = app.state.fp_rate[fp.session_id]
+        dq.append(now)
+        while dq and now - dq[0] > 60.0:
+            dq.popleft()
+        if len(dq) > FP_RATE:
+            raise HTTPException(429, "fingerprint rate limit exceeded")
+        store = app.state.fp
+        if fp.op == "write":
+            if fp.agent_id not in store and len(store) >= 4096:
+                store.pop(next(iter(store)))   # bound agent churn
+            store[fp.agent_id].append(
+                (now, fp.kind, fp.value, fp.sha, set(fp.shingles)))
+            return {"echo": False}
+        # read: compare against OTHER agents' writes in the coord window
+        writers, shingles_r = [], set(fp.shingles)
+        for aid, entries in store.items():
+            if aid == fp.agent_id:
+                continue
+            for ts, kind, resource, sha, sh in reversed(entries):
+                if now - ts > COORD_WINDOW:
+                    break  # per-agent deque is append-ordered
+                if (fp.sha and fp.sha == sha) or \
+                        (shingles_r and sh and
+                         _fp_overlap(shingles_r, sh) >= FP_OVERLAP):
+                    writers.append({"agent": aid, "kind": kind,
+                                    "resource": resource})
+                    break   # one match per writer agent is enough
+        return {"echo": bool(writers), "writers": writers}
 
     @app.get("/events")
     def events(request: Request, session: Optional[str] = None,
@@ -1601,6 +2405,40 @@ def create_app(db_path: str = "corral.db"):
         p = app.state.anomaly.comm_policy
         return {"links": [l.model_dump() for l in p.links],
                 "default": p.default}
+
+    # v1.0.2: learn mode (external review — "run a learn mode that
+    # proposes CommPolicy from observed traffic before enforcing").
+    # With CORRAL_LEARN=1 the defender converts each would-be
+    # quarantine into a proposal; the operator reviews and promotes
+    # links into policy. Proposals are admin-only: an agent must never
+    # learn what the defender is learning about it.
+    @app.post("/comm_policy/proposals")
+    def add_proposal(p: LearnProposalIn, request: Request):
+        require_ingest(request)
+        key = (p.writer, p.reader, p.resource)
+        pr = app.state.proposals.get(key)
+        now = time.time()
+        if pr:
+            pr["count"] += 1
+            pr["last"] = now
+        else:
+            # v1.0.3: bound the proposal space — learn mode must not be
+            # a memory-exhaustion or proposal-flooding vector
+            if len(app.state.proposals) >= PROPOSALS_MAX:
+                return {"ok": False, "reason": "proposal store full"}
+            app.state.proposals[key] = {"writer": p.writer,
+                                        "reader": p.reader,
+                                        "resource": p.resource,
+                                        "count": 1,
+                                        "first": now, "last": now}
+        return {"ok": True}
+
+    @app.get("/comm_policy/proposals")
+    def list_proposals(request: Request):
+        require_admin(request)
+        props = sorted(app.state.proposals.values(),
+                       key=lambda x: -x["count"])
+        return {"proposals": props, "learn_mode": LEARN_MODE}
 
     @app.post("/blocks")
     def add_block(b: BlockIn, request: Request):
@@ -1723,7 +2561,8 @@ Given recent flagged events from an AI agent fleet, respond ONLY with a JSON obj
 {"threat_class": one of ["egress_escape","unsanctioned_comm","credential_access",
    "supply_chain","ssrf_chain","code_exec_watch","scope_drift",
    "velocity_abuse","relay_laundering","possible_exfil","dormant_channel",
-   "session_ip_change","baseline_deviation","benign"],
+   "session_ip_change","baseline_deviation","canary_touch","content_echo",
+   "egress_budget","benign"],
  "severity": one of ["low","medium","high","critical"],
  "confidence": float 0.0-1.0,
  "playbook": same as threat_class,
@@ -1746,6 +2585,8 @@ FALLBACK_SEVERITY = {
     "possible_exfil": "medium", "relay_laundering": "medium",
     "dormant_channel": "low", "session_ip_change": "medium",
     "baseline_deviation": "medium",
+    "canary_touch": "high", "content_echo": "high",   # v1.0.2
+    "egress_budget": "medium",
 }
 
 _SEV_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
@@ -1805,6 +2646,17 @@ PLAYBOOK_ACTIONS = {
     "dormant_channel":   [("report", 1)],
     "session_ip_change": [("report", 1)],
     "baseline_deviation": [("report", 1)],
+    # v1.0.2: a canary touch is near-zero false positive — suspend on
+    # sight.
+    "canary_touch":      [("suspend", 1), ("report", 1)],
+    # v1.0.3: content_echo response is ASYMMETRIC (self-red-team). Echo
+    # evidence is content-based and resource-independent — a planter can
+    # fingerprint content an innocent is about to read, so suspending
+    # the reader is aimable. The server-verified writers are suspended
+    # instead; the reader is reported and both resources are blocked.
+    "content_echo":      [("suspend_echo_writers", 1),
+                          ("block_resource", 1), ("report", 1)],
+    "egress_budget":     [("report", 1)],
     "report_only":       [("report", 1)],
 }
 
@@ -1826,28 +2678,114 @@ def _downgrade_if_weak_signal(verdict: Verdict, events: list[dict]) -> Verdict:
                                   "downgraded to report-only.)")
     return verdict
 
+def _agent_session_map(client: CorralClient) -> dict:
+    """agent_id -> [session_id, ...] from the collector's session list —
+    the basis of agent-level quarantine."""
+    try:
+        r = client._http.get("/sessions")
+        if r.status_code == 200:
+            out: dict[str, list] = {}
+            for s in r.json().get("sessions", []):
+                out.setdefault(s["agent_id"], []).append(s["session_id"])
+            return out
+    except Exception:
+        pass
+    return {}
+
 def execute_playbook(verdict: Verdict, session_ids: list[str],
                      events: list[dict], client: CorralClient):
     executed, staged = [], []
+    # v1.0.3: the kill switch is agent-level (self-red-team — a
+    # session-scoped suspension was escaped by re-registering under a
+    # fresh session identity; the principal is the agent)
+    _by_agent: dict = {}
+
+    def suspend_agent(agent_id: str, fallback_sid: Optional[str] = None):
+        nonlocal _by_agent
+        if not _by_agent:
+            _by_agent = _agent_session_map(client)
+        targets = _by_agent.get(agent_id) or \
+            ([fallback_sid] if fallback_sid else [])
+        for sid in targets:
+            client._try("POST", f"/sessions/{sid}/suspend")
+            executed.append({"type": "suspend", "tier": 1,
+                             "session": sid,
+                             "detail": f"session suspended (agent-level "
+                                       f"quarantine: {agent_id})"})
+
     for action_type, tier in PLAYBOOK_ACTIONS.get(
             verdict.playbook, [("suspend", 1), ("report", 1)]):
         if action_type == "suspend":
-            for sid in session_ids:
-                client._try("POST", f"/sessions/{sid}/suspend")
-                executed.append({"type": "suspend", "tier": 1,
-                                 "session": sid, "detail": "session suspended"})
+            agents = {e.get("agent_id") for e in events
+                      if e.get("agent_id")}
+            if agents:
+                sid_of = {}
+                for e in events:
+                    sid_of.setdefault(e.get("agent_id"),
+                                      e.get("session_id"))
+                for aid in sorted(agents):
+                    suspend_agent(aid, sid_of.get(aid))
+            else:
+                for sid in session_ids:
+                    client._try("POST", f"/sessions/{sid}/suspend")
+                    executed.append({"type": "suspend", "tier": 1,
+                                     "session": sid,
+                                     "detail": "session suspended"})
+        elif action_type == "suspend_echo_writers":
+            # v1.0.3: asymmetric echo response — suspend the
+            # server-verified PLANTERS, report the reader. Echo evidence
+            # is content-based and resource-independent, so reader-side
+            # suspension is aimable at innocents.
+            writers = set()
+            for e in events:
+                for w in (e.get("args") or {}).get("__echo_writers") or []:
+                    if isinstance(w, dict) and w.get("agent"):
+                        writers.add(w["agent"])
+            for aid in sorted(writers):
+                suspend_agent(aid)
         elif action_type == "block_resource":
             seen = set()
             for e in events:
                 r = e.get("resource")
-                if r and (r["kind"], r["value"]) not in seen:
-                    seen.add((r["kind"], r["value"]))
+                if not r:
+                    continue
+                # v1.0.2: block the COORDINATION identity (host+path
+                # for domains), not the bare host — fleet-blocking
+                # api.example.com over one channel is the blast-radius
+                # outage the external review warned about
+                bv = r.get("coord") or r["value"]
+                if (r["kind"], bv) not in seen:
+                    seen.add((r["kind"], bv))
                     client._try("POST", "/blocks",
-                                json={"kind": r["kind"], "value": r["value"],
+                                json={"kind": r["kind"], "value": bv,
                                       "reason": f"playbook:{verdict.playbook}",
                                       "ttl": BLOCK_TTL})
                     executed.append({"type": "block_resource", "tier": 1,
-                                     "resource": r, "detail": "resource blocked"})
+                                     "resource": r,
+                                     "detail": "resource blocked"})
+            # v1.0.3: content_echo — also block the verified writer
+            # resources (the planter's side of the renamed channel)
+            if verdict.playbook == "content_echo":
+                for e in events:
+                    for w in (e.get("args") or {}).get(
+                            "__echo_writers") or []:
+                        if not isinstance(w, dict) or not w.get("resource"):
+                            continue
+                        wk = w.get("kind") or "file"
+                        if (wk, w["resource"]) in seen:
+                            continue
+                        seen.add((wk, w["resource"]))
+                        client._try("POST", "/blocks",
+                                    json={"kind": wk,
+                                          "value": w["resource"],
+                                          "reason": "playbook:content_echo"
+                                                    " (writer)",
+                                          "ttl": BLOCK_TTL})
+                        executed.append(
+                            {"type": "block_resource", "tier": 1,
+                             "resource": {"kind": wk,
+                                          "value": w["resource"]},
+                             "detail": "echo writer resource blocked"})
         elif action_type == "rotate_credential":
             for e in events:
                 r = e.get("resource")
@@ -2119,7 +3057,10 @@ def _enrich_incident(client, llm, iid, sessions, evs, executed, staged,
         traceback.print_exc()
 
 def _respond_campaign(client: CorralClient, llm, comm_evs: list[dict]):
-    resources = {(e["resource"]["kind"], e["resource"]["value"])
+    # v1.0.2: coordination identity — campaign resources key on coord
+    # (host+path for domains), exactly as the access graph stores them
+    resources = {(e["resource"]["kind"],
+                  e["resource"].get("coord") or e["resource"]["value"])
                  for e in comm_evs if e.get("resource")}
     since = _started_of(comm_evs) - COORD_WINDOW
     all_access = []
@@ -2132,9 +3073,49 @@ def _respond_campaign(client: CorralClient, llm, comm_evs: list[dict]):
                 all_access.extend(r.json()["access"])
         except Exception:
             pass
-    sessions = sorted({a["session_id"] for a in all_access})
+    # v1.0.2: LEARN MODE (external review — "run a learn mode that
+    # proposes CommPolicy from observed traffic before enforcing").
+    # Every would-be quarantine becomes a proposal the operator can
+    # promote into policy; nothing is suspended or blocked.
+    if LEARN_MODE:
+        writer_agents = sorted({a["agent_id"] for a in all_access
+                                if a["op"] in ("write", "access")})
+        reader_agents = sorted({e["agent_id"] for e in comm_evs})
+        n = 0
+        for w in writer_agents:
+            for rd in reader_agents:
+                if w == rd:
+                    continue
+                for kind, value in sorted(resources):
+                    client._try("POST", "/comm_policy/proposals",
+                                json={"writer": w, "reader": rd,
+                                      "resource": f"{kind}:{value}"})
+                    n += 1
+        print(f"[defender] LEARN MODE — {n} CommPolicy proposal(s) "
+              f"filed on {sorted(resources)}; no quarantine applied")
+        return
+    # v1.0.2: SCOPED quarantine (external review — suspending every
+    # session that ever touched a shared resource is a self-DoS on a
+    # shared host). Suspend the writers whose content was consumed and
+    # the readers caught consuming it — nobody else.
+    writers = sorted({a["session_id"] for a in all_access
+                      if a["op"] in ("write", "access")})
+    sessions = sorted(set(writers) |
+                      {e["session_id"] for e in comm_evs})
     if not sessions:
         sessions = sorted({e["session_id"] for e in comm_evs})
+    # v1.0.3: quarantine binds the AGENT, not just the caught session —
+    # every session of a flagged agent is suspended, and re-registration
+    # is refused server-side while the quarantine stands
+    flagged_agents = ({a["agent_id"] for a in all_access
+                       if a["session_id"] in sessions} |
+                      {e["agent_id"] for e in comm_evs
+                       if e["session_id"] in sessions})
+    by_agent = _agent_session_map(client)
+    agent_sessions = sorted({sid for aid in flagged_agents
+                             for sid in by_agent.get(aid, [])})
+    if agent_sessions:
+        sessions = agent_sessions
     if _coalesced(("unsanctioned_comm", tuple(sessions),
                    tuple(sorted(resources)))):
         # coalesce paperwork, re-apply enforcement (v0.5.2)
@@ -3445,6 +4426,715 @@ def selftest() -> int:
           f"resumed={resumed} re-suspended={bool(re_susp)} "
           f"incidents {n_inc_2}->{n_inc_3}")
 
+    print("--- v1.0.2 external-review hardening ---")
+    mod = sys.modules[__name__]
+
+    def _file_pol(aid, tools=("write_file", "read_file")):
+        return AgentPolicy(agent_id=aid, allowed_tools=list(tools),
+                           allowed_domains=[])
+
+    # -- pure-function regressions (no server round-trip) ----------------
+    # verb classifier: whole-WORD tokenization — under substring matching
+    # get_aSETs, read_SETtings, get_outPUT and get_dataSET were all
+    # classified as writes, hiding covert reads (external review)
+    check("verb classifier tokenizes on word boundaries",
+          op_of("get_dataset") == "read"
+          and op_of("read_settings") == "read"
+          and op_of("get_assets") == "read"
+          and op_of("get_output") == "read"
+          and op_of("write_file") == "write"
+          and op_of("publish_package") == "write")
+    check("unknown verb is 'access' — counts as read AND write in graph",
+          op_of("frobnicate_data") == "access"
+          and op_of("sync_board") == "access")
+    # word-boundary sensitive matching: tokenizer.json and .env.example
+    # false-positived; shadow/environ/netrc/kube/id_ed25519 were missed
+    check("sensitive matching: word boundaries + expanded denylist",
+          not _is_sensitive("tokenizer.json", SENSITIVE_DEFAULT)
+          and not _is_sensitive("tiktoken/model.json", SENSITIVE_DEFAULT)
+          and not _is_sensitive(".env.example", SENSITIVE_DEFAULT)
+          and not _is_sensitive("environment.yml", SENSITIVE_DEFAULT)
+          and _is_sensitive("api-token.json", SENSITIVE_DEFAULT)
+          and _is_sensitive("/etc/shadow", SENSITIVE_DEFAULT)
+          and _is_sensitive("/proc/self/environ", SENSITIVE_DEFAULT)
+          and _is_sensitive("/home/u/.netrc", SENSITIVE_DEFAULT)
+          and _is_sensitive("/home/u/.kube/config", SENSITIVE_DEFAULT)
+          and _is_sensitive("id_ed25519", SENSITIVE_DEFAULT))
+    # prefix allow needs a path boundary: /data/work must not allow
+    # /data/workspace_other/x
+    pol_pb = AgentPolicy(agent_id="st-pb", allowed_tools=["read_file"],
+                         allowed_domains=[],
+                         allowed_file_prefixes=["/data/work"])
+    ok_in, _ = evaluate_policy(
+        pol_pb, "read_file", {},
+        Resource(kind=ResourceKind.file, value="/data/work/report.md"))
+    ok_exact, _ = evaluate_policy(
+        pol_pb, "read_file", {},
+        Resource(kind=ResourceKind.file, value="/data/work"))
+    ok_out, why_out = evaluate_policy(
+        pol_pb, "read_file", {},
+        Resource(kind=ResourceKind.file, value="/data/workspace_other/x"))
+    check("file prefix matching respects path boundaries",
+          ok_in and ok_exact and not ok_out, f"outside={why_out!r}")
+    # every call resource extracted and policy-checked — the second
+    # resource used to walk straight past the allowlist
+    rs_multi = extract_resources(
+        "upload", {"url": "https://registry.internal/x",
+                   "path": "/etc/shadow"})
+    ok_m, why_m = evaluate_policy_all(
+        AgentPolicy(agent_id="st-m", allowed_tools=["upload"],
+                    allowed_domains=["registry.internal"]),
+        "upload", {}, rs_multi)
+    check("multi-resource calls: every resource policy-checked",
+          len(rs_multi) >= 2 and not ok_m and "shadow" in why_m,
+          f"{[(r.kind.value, r.value) for r in rs_multi]} → {why_m!r}")
+    # URLs inside CONTENT args are policy-checked but never graphed —
+    # citing a link is not a channel; proxying one is
+    rs_cu = extract_resources(
+        "http_get", {"url": "https://registry.internal/proxy",
+                     "query": "fetch https://evil.example.com/c2"})
+    cu = [r for r in rs_cu if r.source == "content_scan"]
+    ok_cu, why_cu = evaluate_policy_all(
+        AgentPolicy(agent_id="st-cu", allowed_tools=["http_get"],
+                    allowed_domains=["registry.internal"]),
+        "http_get", {}, rs_cu)
+    check("URL embedded in content arg is policy-checked (not graphed)",
+          len(cu) == 1 and cu[0].value == "evil.example.com"
+          and not ok_cu and "evil.example.com" in why_cu,
+          f"{[(r.kind.value, r.value, r.source) for r in rs_cu]}")
+    rs_cd = extract_resources(
+        "http_get", {"url": "https://api.internal/stchan-a/msg-9"})
+    check("domain resources carry coordination identity (host+path)",
+          bool(rs_cd) and rs_cd[0].value == "api.internal"
+          and rs_cd[0].coord == "api.internal/stchan-a",
+          f"{[(r.value, r.coord) for r in rs_cd]}")
+    sha1, sh1 = _fingerprint(
+        "alpha bravo charlie delta echo foxtrot golf hotel india "
+        "juliet kilo lima mike november oscar papa quebec romeo")
+    sha2, sh2 = _fingerprint(
+        "alpha bravo charlie delta echo foxtrot golf hotel india "
+        "juliet kilo lima mike november oscar papa quebec romeo")
+    check("content fingerprints deterministic across processes "
+          "(sha + shingles)",
+          sha1 == sha2 and sh1 == sh2
+          and _fp_overlap(sh1, sh2) == 1.0)
+
+    # -- server-backed behavioral regressions ----------------------------
+    # (a) principal = agent_id: a restarted agent (new session, same
+    # agent) reading its OWN checkpoint is not cross-agent coordination
+    gck1 = GuardedAgent("st-ckpt", _file_pol("st-ckpt"),
+                        client=CorralClient(base))
+    gck1.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/ckpt-agent.md", content="checkpoint state blob")
+    gck2 = GuardedAgent("st-ckpt", _file_pol("st-ckpt"),
+                        client=CorralClient(base))
+    gck2.tool(lambda path: "checkpoint state blob", name="read_file")(
+        path="shared/ckpt-agent.md")
+    time.sleep(0.3)
+    ck_evs = httpx.get(f"{base}/events",
+                       params={"session": gck2.session_id},
+                       timeout=5).json()["events"]
+    check("restart-checkpoint: same-agent read across sessions clean",
+          gck1.session_id != gck2.session_id and bool(ck_evs)
+          and not any("unsanctioned_comm" in e["flags"]
+                      or "dormant_channel" in e["flags"]
+                      for e in ck_evs),
+          f"flags: {[e['flags'] for e in ck_evs]}")
+    # (b) behavioral windows are agent-keyed: churning sessions does not
+    # reset the egress streak
+    pol_ch = AgentPolicy(agent_id="st-churn", allowed_tools=["http_get"],
+                         allowed_domains=["api.internal"])
+    def _blocked_egress(g):
+        try:
+            g.tool(lambda url: "ok", name="http_get")(
+                url="http://198.51.100.77/beacon")
+        except PolicyBlocked:
+            pass
+    gch1 = GuardedAgent("st-churn", pol_ch, client=CorralClient(base))
+    _blocked_egress(gch1)
+    _blocked_egress(gch1)
+    gch2 = GuardedAgent("st-churn", pol_ch, client=CorralClient(base))
+    _blocked_egress(gch2)     # third attempt, fresh session
+    time.sleep(0.3)
+    ch_evs = httpx.get(f"{base}/events",
+                       params={"session": gch2.session_id},
+                       timeout=5).json()["events"]
+    check("egress streak survives session churn (agent-keyed windows)",
+          any("egress_escape" in e["flags"] for e in ch_evs),
+          f"flags: {[e['flags'] for e in ch_evs]}")
+    # (c) EVERY writer must be sanctioned — a rogue writing into a
+    # sanctioned channel can no longer ride the legitimate writer's link
+    httpx.post(f"{base}/comm_policy", json={"links": [
+        {"writer": "st-legit-*", "reader": "st-victim-*",
+         "resource": "file:shared/launder*"}]}, timeout=5)
+    glw2 = GuardedAgent("st-legit-w", _file_pol("st-legit-w"),
+                        client=CorralClient(base))
+    grg = GuardedAgent("st-rogue-l", _file_pol("st-rogue-l"),
+                       client=CorralClient(base))
+    gvt = GuardedAgent("st-victim-r", _file_pol("st-victim-r"),
+                       client=CorralClient(base))
+    glw2.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/launder-note.md", content="legitimate handoff")
+    grg.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/launder-note.md", content="rogue payload")
+    gvt.tool(lambda path: "x", name="read_file")(
+        path="shared/launder-note.md")
+    time.sleep(0.3)
+    vt_evs = httpx.get(f"{base}/events",
+                       params={"session": gvt.session_id},
+                       timeout=5).json()["events"]
+    check("rogue writer in a sanctioned channel still flags "
+          "(ALL writers must be covered)",
+          any("unsanctioned_comm" in e["flags"] for e in vt_evs),
+          f"flags: {[e['flags'] for e in vt_evs]}")
+    # (d) coordination identity: same host, different endpoint = no
+    # channel; same endpoint = channel
+    def _msg_pol(aid):
+        return AgentPolicy(agent_id=aid,
+                           allowed_tools=["post_message", "get_message"],
+                           allowed_domains=["api.internal"])
+    gcw = GuardedAgent("st-coord-w", _msg_pol("st-coord-w"),
+                       client=CorralClient(base))
+    gcw.tool(lambda url, body: "ok", name="post_message")(
+        url="https://api.internal/stchan-a/msg-1", body="hello")
+    gcr1 = GuardedAgent("st-coord-r1", _msg_pol("st-coord-r1"),
+                        client=CorralClient(base))
+    gcr1.tool(lambda url: "nothing", name="get_message")(
+        url="https://api.internal/stchan-b/inbox")    # different endpoint
+    gcr2 = GuardedAgent("st-coord-r2", _msg_pol("st-coord-r2"),
+                        client=CorralClient(base))
+    gcr2.tool(lambda url: "hello", name="get_message")(
+        url="https://api.internal/stchan-a/inbox")    # same endpoint
+    time.sleep(0.3)
+    cd1 = httpx.get(f"{base}/events", params={"session": gcr1.session_id},
+                    timeout=5).json()["events"]
+    cd2 = httpx.get(f"{base}/events", params={"session": gcr2.session_id},
+                    timeout=5).json()["events"]
+    check("coord identity: different endpoint on shared host is clean",
+          bool(cd1) and not any("unsanctioned_comm" in e["flags"]
+                                for e in cd1),
+          f"flags: {[e['flags'] for e in cd1]}")
+    check("coord identity: same endpoint on shared host flags",
+          any("unsanctioned_comm" in e["flags"] for e in cd2),
+          f"flags: {[e['flags'] for e in cd2]}")
+    # (e) scoped blocking: the defender blocks the channel ENDPOINT, not
+    # the bare host — one channel must not fleet-block a shared API
+    httpx.post(f"{base}/blocks",
+               json={"kind": "domain", "value": "api.internal/stchan-a",
+                     "reason": "selftest", "ttl": 60}, timeout=5)
+    gsb = GuardedAgent("st-scoped", _msg_pol("st-scoped"),
+                       client=CorralClient(base))   # fresh blocklist cache
+    try:
+        gsb.tool(lambda url: "x", name="get_message")(
+            url="https://api.internal/stchan-a/again")
+        scoped_block = False
+    except PolicyBlocked:
+        scoped_block = True
+    try:
+        gsb.tool(lambda url: "x", name="get_message")(
+            url="https://api.internal/stchan-b/free")
+        host_free = True
+    except PolicyBlocked:
+        host_free = False
+    check("scoped block: endpoint blocked, bare host still reachable",
+          scoped_block and host_free,
+          f"endpoint_blocked={scoped_block} host_free={host_free}")
+    httpx.delete(f"{base}/blocks",
+                 params={"kind": "domain",
+                         "value": "api.internal/stchan-a"}, timeout=5)
+    # (f) name-encoded channels: the message lives in a child NAME; a
+    # read of the parent prefix correlates with writes underneath it
+    gpw2 = GuardedAgent("st-pfx-w", _file_pol("st-pfx-w"),
+                        client=CorralClient(base))
+    gpw2.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/st-registry/9f3ae2-payload", content="x")
+    gpr2 = GuardedAgent("st-pfx-r", _file_pol("st-pfx-r"),
+                        client=CorralClient(base))
+    gpr2.tool(lambda path: ["9f3ae2-payload"], name="read_file")(
+        path="shared/st-registry")
+    time.sleep(0.3)
+    pfx = httpx.get(f"{base}/events", params={"session": gpr2.session_id},
+                    timeout=5).json()["events"]
+    check("prefix correlation: parent listing flags writes underneath",
+          any("unsanctioned_comm" in e["flags"] for e in pfx),
+          f"flags: {[e['flags'] for e in pfx]}")
+    # package-prefix variant — name-encoded board in package names
+    pol_pkg = lambda aid: AgentPolicy(agent_id=aid,
+                                      allowed_tools=["publish", "fetch"],
+                                      allowed_domains=[])
+    gkw = GuardedAgent("st-pkg-w", pol_pkg("st-pkg-w"),
+                       client=CorralClient(base))
+    gkw.tool(lambda name, content: "ok", name="publish")(
+        name="stpkg-internal-9f3ae", content="x")
+    gkr = GuardedAgent("st-pkg-r", pol_pkg("st-pkg-r"),
+                       client=CorralClient(base))
+    gkr.tool(lambda name: "x", name="fetch")(name="stpkg-internal")
+    time.sleep(0.3)
+    pkx = httpx.get(f"{base}/events", params={"session": gkr.session_id},
+                    timeout=5).json()["events"]
+    check("prefix correlation: package-name prefix read flags",
+          any("unsanctioned_comm" in e["flags"] for e in pkx),
+          f"flags: {[e['flags'] for e in pkx]}")
+    # (g) unknown verbs can't hide a channel: a sync_* write and a
+    # frobnicate_* read both count as access (read+write in the graph)
+    guw = GuardedAgent(
+        "st-unk-w", AgentPolicy(agent_id="st-unk-w",
+                                allowed_tools=["sync_board"],
+                                allowed_domains=[]),
+        client=CorralClient(base))
+    guw.tool(lambda path, content: "ok", name="sync_board")(
+        path="shared/unk-note.md", content="x")
+    gur = GuardedAgent(
+        "st-unk-r", AgentPolicy(agent_id="st-unk-r",
+                                allowed_tools=["frobnicate_data"],
+                                allowed_domains=[]),
+        client=CorralClient(base))
+    gur.tool(lambda path: "x", name="frobnicate_data")(
+        path="shared/unk-note.md")
+    time.sleep(0.3)
+    unk = httpx.get(f"{base}/events", params={"session": gur.session_id},
+                    timeout=5).json()["events"]
+    check("unknown-verb write + read still correlates (access = both)",
+          any("unsanctioned_comm" in e["flags"] for e in unk),
+          f"flags: {[e['flags'] for e in unk]}")
+    # (h) canary/honeytoken touch — near-zero-FP tripwire
+    saved_canaries = mod.CANARIES
+    mod.CANARIES = ["st-honey-9x"]
+    try:
+        ghc = GuardedAgent("st-canary", _file_pol("st-canary"),
+                           client=CorralClient(base))
+        ghc.tool(lambda path: "x", name="read_file")(
+            path="shared/st-honey-9x-creds.txt")
+        time.sleep(0.3)
+        hc = httpx.get(f"{base}/events",
+                       params={"session": ghc.session_id},
+                       timeout=5).json()["events"]
+        check("canary touch flagged on honeytoken resource",
+              any("canary_touch" in e["flags"] for e in hc),
+              f"flags: {[e['flags'] for e in hc]}")
+    finally:
+        mod.CANARIES = saved_canaries
+    # (i) content-flow fingerprints: rename the channel all you like —
+    # the BYTES correlate. Same-agent read-back is clean.
+    para = ("quarterly planning notes covering migration sequence "
+            "budget approval vendor selection rollout timeline staffing "
+            "and the contingency plan for the regional launch window "
+            "with checkpoints every friday until completion")
+    gfw = GuardedAgent("st-fp-w", _file_pol("st-fp-w"),
+                       client=CorralClient(base))
+    gfw.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/fp-src.md", content=para)
+    gfr = GuardedAgent("st-fp-r", _file_pol("st-fp-r"),
+                       client=CorralClient(base))
+    gfr.tool(lambda path: para, name="read_file")(
+        path="shared/fp-renamed-copy.md")      # renamed, same bytes
+    gfr2 = GuardedAgent("st-fp-r2", _file_pol("st-fp-r2"),
+                        client=CorralClient(base))
+    gfr2.tool(lambda path: para.replace("friday", "monday"),
+              name="read_file")(path="shared/fp-other-copy.md")
+    gfw.tool(lambda path: para, name="read_file")(
+        path="shared/fp-src.md")               # writer reads its own back
+    time.sleep(0.3)
+    fp1 = httpx.get(f"{base}/events", params={"session": gfr.session_id},
+                    timeout=5).json()["events"]
+    fp2 = httpx.get(f"{base}/events",
+                    params={"session": gfr2.session_id},
+                    timeout=5).json()["events"]
+    fpw = httpx.get(f"{base}/events", params={"session": gfw.session_id},
+                    timeout=5).json()["events"]
+    check("content echo: exact bytes across a renamed channel flag",
+          any("content_echo" in e["flags"] for e in fp1),
+          f"flags: {[e['flags'] for e in fp1]}")
+    check("content echo: near-duplicate content flags (shingle overlap)",
+          any("content_echo" in e["flags"] for e in fp2),
+          f"flags: {[e['flags'] for e in fp2]}")
+    check("content echo: same-agent read-back stays clean",
+          not any("content_echo" in e["flags"] for e in fpw),
+          f"flags: {[e['flags'] for e in fpw]}")
+    # (j) egress volume budget per agent+domain — low-entropy exfil
+    # defeats the entropy heuristic but still has to move the bytes
+    saved_budget = mod.EGRESS_BUDGET
+    mod.EGRESS_BUDGET = 2000
+    try:
+        geb = GuardedAgent(
+            "st-budget", AgentPolicy(agent_id="st-budget",
+                                     allowed_tools=["http_get"],
+                                     allowed_domains=["api.internal"]),
+            client=CorralClient(base))
+        tb = geb.tool(lambda url, query: "ok", name="http_get")
+        for i in range(4):
+            tb(url="https://api.internal/stream",
+               query="padding-" + "a" * 600)
+        time.sleep(0.3)
+        eb = httpx.get(f"{base}/events",
+                       params={"session": geb.session_id},
+                       timeout=5).json()["events"]
+        check("egress volume budget flags bulk transfer to one domain",
+              any("egress_budget" in e["flags"] for e in eb),
+              f"flags: {[e['flags'] for e in eb]}")
+    finally:
+        mod.EGRESS_BUDGET = saved_budget
+    # (k) identity hardening on an isolated app: per-agent keys, auth
+    # before body parsing, admin-only metrics, registration caps
+    from fastapi.testclient import TestClient
+    saved_cfg = (mod.AGENT_KEYS, mod.CORRAL_API_KEY, mod.CORRAL_INGEST_KEY,
+                 mod.MAX_SESSIONS, mod.REG_RATE)
+    mod.AGENT_KEYS = [("worker-*", "wk1")]
+    mod.CORRAL_API_KEY = "adm1"
+    mod.CORRAL_INGEST_KEY = "ing1"
+    try:
+        tc = TestClient(create_app(os.path.join(OUT_DIR,
+                                                "selftest-auth.db")))
+        ing = {"x-corral-ingest-key": "ing1"}
+        adm = {"x-corral-key": "adm1"}
+        wk = {**ing, "x-corral-agent-key": "wk1"}
+        r_noauth = tc.post("/events", json={"garbage": 1})
+        r_auth = tc.post("/events", json={"garbage": 1}, headers=ing)
+        check("unauthenticated garbage rejected 401 before parsing",
+              r_noauth.status_code == 401 and r_auth.status_code == 422,
+              f"no-key={r_noauth.status_code} "
+              f"with-key={r_auth.status_code}")
+        check("/metrics is admin-only",
+              tc.get("/metrics").status_code == 401
+              and tc.get("/metrics", headers=ing).status_code == 401
+              and tc.get("/metrics", headers=adm).status_code == 200)
+        check("health endpoint stays open for liveness probes",
+              tc.get("/health").status_code == 200)
+        r_no = tc.post("/sessions", json={"session_id": "s1",
+                                          "agent_id": "worker-1"},
+                       headers=ing)
+        r_bad = tc.post("/sessions", json={"session_id": "s1",
+                                           "agent_id": "worker-1"},
+                        headers={**ing, "x-corral-agent-key": "nope"})
+        r_ok = tc.post("/sessions", json={"session_id": "s1",
+                                          "agent_id": "worker-1"},
+                       headers=wk)
+        r_esc = tc.post("/sessions", json={"session_id": "s2",
+                                           "agent_id": "orchestrator-9"},
+                        headers=wk)
+        check("per-agent keys bind identity at registration",
+              r_no.status_code == 403 and r_bad.status_code == 403
+              and r_ok.status_code == 200 and r_esc.status_code == 403,
+              f"none={r_no.status_code} wrong={r_bad.status_code} "
+              f"ok={r_ok.status_code} escalate={r_esc.status_code}")
+        # fleet cap, then per-agent registration rate
+        mod.MAX_SESSIONS = 2
+        tc.post("/sessions", json={"session_id": "s3",
+                                   "agent_id": "worker-2"}, headers=wk)
+        r_cap = tc.post("/sessions", json={"session_id": "s4",
+                                           "agent_id": "worker-3"},
+                        headers=wk)
+        mod.MAX_SESSIONS = 10000
+        mod.REG_RATE = 2
+        rr = [tc.post("/sessions",
+                      json={"session_id": f"sr{i}",
+                            "agent_id": "worker-rr"}, headers=wk)
+              for i in range(3)]
+        check("registration fleet cap + per-agent rate enforced",
+              r_cap.status_code == 403
+              and [x.status_code for x in rr] == [200, 200, 429],
+              f"cap={r_cap.status_code} "
+              f"rate={[x.status_code for x in rr]}")
+    finally:
+        (mod.AGENT_KEYS, mod.CORRAL_API_KEY, mod.CORRAL_INGEST_KEY,
+         mod.MAX_SESSIONS, mod.REG_RATE) = saved_cfg
+    # (l) learn mode: propose CommPolicy from observed traffic instead
+    # of quarantining — the adoption path for strict zero-trust
+    glw3 = GuardedAgent("st-learn-w", _file_pol("st-learn-w"),
+                        client=CorralClient(base))
+    glw3.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/learn-drop.md", content="x")
+    glr3 = GuardedAgent("st-learn-r", _file_pol("st-learn-r"),
+                        client=CorralClient(base))
+    glr3.tool(lambda path: "x", name="read_file")(
+        path="shared/learn-drop.md")
+    time.sleep(0.3)
+    lrn = [e for e in httpx.get(
+        f"{base}/events", params={"session": glr3.session_id},
+        timeout=5).json()["events"] if "unsanctioned_comm" in e["flags"]]
+    mod.LEARN_MODE = True
+    try:
+        _respond_campaign(CorralClient(base), None, lrn)
+        time.sleep(0.2)
+        props = httpx.get(f"{base}/comm_policy/proposals",
+                          timeout=5).json()["proposals"]
+        sw = httpx.get(f"{base}/sessions/{glw3.session_id}",
+                       timeout=5).json()
+        sr = httpx.get(f"{base}/sessions/{glr3.session_id}",
+                       timeout=5).json()
+        check("learn mode proposes CommPolicy, quarantines nobody",
+              any(p["writer"] == "st-learn-w"
+                  and p["reader"] == "st-learn-r"
+                  and "learn-drop" in p["resource"] for p in props)
+              and not sw.get("suspended") and not sr.get("suspended"),
+              f"proposals={[(p['writer'], p['reader'], p['resource'])
+                            for p in props]} "
+              f"suspended={sw.get('suspended')}/{sr.get('suspended')}")
+    finally:
+        mod.LEARN_MODE = False
+
+    print("--- v1.0.3 self-red-team hardening ---")
+    # (a) agent-level quarantine: a suspended agent may not re-register
+    # under a fresh session identity, and the SDK halts on the refusal
+    gq = GuardedAgent("st-quar", _file_pol("st-quar"),
+                      client=CorralClient(base))
+    gq.tool(lambda path: "x", name="read_file")(path="shared/quar.md")
+    httpx.post(f"{base}/sessions/{gq.session_id}/suspend", timeout=5)
+    r_q = httpx.post(f"{base}/sessions",
+                     json={"session_id": "st-quar-rotated",
+                           "agent_id": "st-quar"}, timeout=5)
+    check("quarantined agent cannot re-register a fresh session",
+          r_q.status_code == 403 and "quarantined" in r_q.text,
+          f"HTTP {r_q.status_code}")
+    gq2 = GuardedAgent("st-quar", _file_pol("st-quar"),
+                       client=CorralClient(base))
+    try:
+        gq2.tool(lambda path: "x", name="read_file")(path="shared/q2.md")
+        check("SDK halts on quarantine-denied registration", False,
+              "call executed")
+    except Halt:
+        check("SDK halts on quarantine-denied registration", True)
+    except Exception as e:
+        check("SDK halts on quarantine-denied registration", False,
+              f"wrapped {type(e).__name__}: {e}")
+    # (b) defender suspension binds the AGENT: flag one session, all
+    # sessions of that agent are quarantined
+    gsib1 = GuardedAgent("st-sib", _file_pol("st-sib"),
+                         client=CorralClient(base))
+    gsib2 = GuardedAgent("st-sib", _file_pol("st-sib"),
+                         client=CorralClient(base))
+    gsib1.tool(lambda path: "x", name="read_file")(path="shared/sib1.md")
+    gsib2.tool(lambda path: "x", name="read_file")(path="shared/sib2.md")
+    execute_playbook(
+        Verdict(threat_class="supply_chain", severity="high",
+                playbook="supply_chain", reasoning="selftest"),
+        [gsib1.session_id],
+        [{"agent_id": "st-sib", "session_id": gsib1.session_id,
+          "resource": None, "args": {}}], CorralClient(base))
+    s1 = httpx.get(f"{base}/sessions/{gsib1.session_id}",
+                   timeout=5).json()
+    s2 = httpx.get(f"{base}/sessions/{gsib2.session_id}",
+                   timeout=5).json()
+    check("defender suspension is agent-level (sibling sessions too)",
+          bool(s1.get("suspended")) and bool(s2.get("suspended")),
+          f"flagged={s1.get('status')} sibling={s2.get('status')}")
+    # (c) forged flags are stripped: client-supplied flags are hints,
+    # not evidence — supply_chain/egress_escape are server-computed,
+    # relay_laundering needs verifiable nested URLs, content_echo needs
+    # verified fingerprints (blocklist-poisoning closed)
+    graw = GuardedAgent(
+        "st-raw", AgentPolicy(agent_id="st-raw",
+                              allowed_tools=["http_get"],
+                              allowed_domains=["api.internal"]),
+        client=CorralClient(base))
+    graw.tool(lambda url: "ok", name="http_get")(
+        url="https://api.internal/ping")
+    tok = graw.client._token
+    httpx.post(f"{base}/events", headers={"X-Corral-Session": tok},
+               timeout=5, json={
+                   "session_id": graw.session_id, "agent_id": "st-raw",
+                   "tool": "http_get",
+                   "args": {"url": "https://api9.internal/plain"},
+                   "resource": {"kind": "domain",
+                                "value": "api9.internal"},
+                   "outcome": "allowed", "reason": "",
+                   "flags": ["supply_chain", "egress_escape",
+                             "relay_laundering", "unsanctioned_comm"],
+                   "op": "read"})
+    httpx.post(f"{base}/events", headers={"X-Corral-Session": tok},
+               timeout=5, json={
+                   "session_id": graw.session_id, "agent_id": "st-raw",
+                   "tool": "http_get",
+                   "args": {"url": "https://api9.internal/scan"
+                                   "?u=http://evil.example.com/x"},
+                   "resource": {"kind": "domain",
+                                "value": "api9.internal"},
+                   "outcome": "allowed", "reason": "",
+                   "flags": ["relay_laundering"], "op": "read"})
+    httpx.post(f"{base}/events", headers={"X-Corral-Session": tok},
+               timeout=5, json={
+                   "session_id": graw.session_id, "agent_id": "st-raw",
+                   "tool": "read_file",
+                   "args": {"path": "shared/whatever.md",
+                            "__echo_writers": [
+                                {"agent": "st-fp-w",
+                                 "resource": "shared/fp-src.md"}],
+                            "__echo_sha": "deadbeef",
+                            "__echo_shingles": [1, 2, 3]},
+                   "resource": {"kind": "file",
+                                "value": "shared/whatever.md"},
+                   "outcome": "allowed", "reason": "",
+                   "flags": ["content_echo"], "op": "read"})
+    time.sleep(0.3)
+    raw_evs = httpx.get(f"{base}/events",
+                        params={"session": graw.session_id},
+                        timeout=5).json()["events"]
+    forged = [e for e in raw_evs
+              if e["args"].get("url", "").endswith("/plain")]
+    relay = [e for e in raw_evs if "scan?u=" in e["args"].get("url", "")]
+    fecho = [e for e in raw_evs
+             if e["args"].get("path") == "shared/whatever.md"]
+    check("forged server-computable flags stripped at ingest",
+          bool(forged) and forged[0]["flags"] == [],
+          f"flags: {forged[0]['flags'] if forged else '?'}")
+    check("relay hint survives only with verifiable nested URLs",
+          bool(relay) and "relay_laundering" in relay[0]["flags"],
+          f"flags: {relay[0]['flags'] if relay else '?'}")
+    check("forged content_echo stripped (no matching fingerprint)",
+          bool(fecho) and "content_echo" not in fecho[0]["flags"],
+          f"flags: {fecho[0]['flags'] if fecho else '?'}")
+    # (d) fingerprint flood evicts only the flooder's own entries —
+    # another agent's evidence survives (per-agent store)
+    gfa = GuardedAgent("st-fpf-w", _file_pol("st-fpf-w"),
+                       client=CorralClient(base))
+    gfa.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/fpf-src.md", content=para)
+    gff = GuardedAgent("st-fpf-flood", _file_pol("st-fpf-flood"),
+                       client=CorralClient(base))
+    gff.tool(lambda path: "x", name="read_file")(path="shared/ff.md")
+    for i in range(FP_PER_AGENT + 50):
+        gff.client.fingerprint(gff.session_id, "st-fpf-flood", "write",
+                               f"junk-{i}", f"sha-{i}", [i])
+    gfr3 = GuardedAgent("st-fpf-r", _file_pol("st-fpf-r"),
+                        client=CorralClient(base))
+    gfr3.tool(lambda path: para, name="read_file")(
+        path="shared/fpf-renamed.md")
+    time.sleep(0.3)
+    fpf = httpx.get(f"{base}/events", params={"session": gfr3.session_id},
+                    timeout=5).json()["events"]
+    check("fingerprint flood cannot evict another agent's evidence",
+          any("content_echo" in e["flags"] for e in fpf),
+          f"flags: {[e['flags'] for e in fpf]}")
+    # (e) the fingerprint endpoint is rate-limited per session
+    saved_fprate = mod.FP_RATE
+    mod.FP_RATE = 10
+    try:
+        codes = []
+        for i in range(14):
+            rr = httpx.post(f"{base}/fingerprints",
+                            headers={"X-Corral-Session": tok},
+                            timeout=5,
+                            json={"session_id": graw.session_id,
+                                  "agent_id": "st-raw", "op": "write",
+                                  "value": f"rl-{i}", "sha": f"r{i}",
+                                  "shingles": [i]})
+            codes.append(rr.status_code)
+        check("fingerprint endpoint rate-limited per session",
+              codes[-1] == 429 and codes[0] == 200,
+              f"codes: {codes[0]}...{codes[-1]}")
+    finally:
+        mod.FP_RATE = saved_fprate
+    # (f) content_echo response is asymmetric: the PLANTER is suspended,
+    # the reader is reported — echo evidence is content-based, so
+    # reader-side suspension is aimable at innocents
+    gaw = GuardedAgent("st-asym-w", _file_pol("st-asym-w"),
+                       client=CorralClient(base))
+    gaw.tool(lambda path, content: "ok", name="write_file")(
+        path="shared/asym-src.md", content=para)
+    gar = GuardedAgent("st-asym-r", _file_pol("st-asym-r"),
+                       client=CorralClient(base))
+    gar.tool(lambda path: para, name="read_file")(
+        path="shared/asym-copy.md")
+    time.sleep(0.3)
+    run_defender(base, use_llm=False, once=True, lookback=300.0)
+    saw = httpx.get(f"{base}/sessions/{gaw.session_id}", timeout=5).json()
+    sar = httpx.get(f"{base}/sessions/{gar.session_id}", timeout=5).json()
+    blk = {b["value"] for b in
+           httpx.get(f"{base}/blocks", timeout=5).json()["blocks"]}
+    check("content_echo: writer suspended, reader reported not suspended",
+          bool(saw.get("suspended")) and not sar.get("suspended"),
+          f"writer={saw.get('status')} reader={sar.get('status')}")
+    check("content_echo: both sides of the renamed channel blocked",
+          "shared/asym-src.md" in blk and "shared/asym-copy.md" in blk,
+          f"blocks: {sorted(b for b in blk if 'asym' in b)}")
+    # (g) per-agent TOTAL egress budget — spreading the drip across
+    # domains no longer hides it
+    saved_tb = (mod.EGRESS_BUDGET, mod.EGRESS_BUDGET_TOTAL)
+    mod.EGRESS_BUDGET = 10 ** 9      # per-domain effectively off
+    mod.EGRESS_BUDGET_TOTAL = 1500
+    try:
+        gtot = GuardedAgent(
+            "st-budget-tot",
+            AgentPolicy(agent_id="st-budget-tot",
+                        allowed_tools=["http_get"],
+                        allowed_domains=["api1.internal", "api2.internal",
+                                         "api3.internal"]),
+            client=CorralClient(base))
+        tt = gtot.tool(lambda url, query: "ok", name="http_get")
+        for d in ("api1.internal", "api2.internal", "api3.internal"):
+            tt(url=f"https://{d}/stream", query="padding-" + "a" * 600)
+        time.sleep(0.3)
+        tev = httpx.get(f"{base}/events",
+                        params={"session": gtot.session_id},
+                        timeout=5).json()["events"]
+        check("per-agent total egress budget catches domain-spreading",
+              any("egress_budget" in e["flags"] for e in tev),
+              f"flags: {[e['flags'] for e in tev]}")
+    finally:
+        mod.EGRESS_BUDGET, mod.EGRESS_BUDGET_TOTAL = saved_tb
+    # (h) bare-host listing correlation: message smuggled in endpoint
+    # NAMES, read via the host root
+    glw4 = GuardedAgent("st-dom-w", _msg_pol("st-dom-w"),
+                        client=CorralClient(base))
+    glw4.tool(lambda url, body: "ok", name="post_message")(
+        url="https://api.internal/stlist-m1/msg", body="x")
+    glr4 = GuardedAgent("st-dom-r", _msg_pol("st-dom-r"),
+                        client=CorralClient(base))
+    glr4.tool(lambda url: "x", name="get_message")(
+        url="https://api.internal")      # bare host — the listing pattern
+    time.sleep(0.3)
+    dle = httpx.get(f"{base}/events", params={"session": glr4.session_id},
+                    timeout=5).json()["events"]
+    check("bare-host listing correlates writes to endpoint names",
+          any("unsanctioned_comm" in e["flags"] for e in dle),
+          f"flags: {[e['flags'] for e in dle]}")
+    # (i) registration abuse on isolated apps: per-IP rate, windowed
+    # fleet cap (history doesn't permanently exhaust it), proposals cap
+    saved_reg = (mod.REG_IP_RATE, mod.MAX_SESSIONS,
+                 mod.SESSION_CAP_WINDOW, mod.PROPOSALS_MAX)
+    try:
+        mod.REG_IP_RATE = 3
+        tc_ip = TestClient(create_app(os.path.join(OUT_DIR,
+                                                   "selftest-iprate.db")))
+        codes = [tc_ip.post("/sessions",
+                            json={"session_id": f"ip{i}",
+                                  "agent_id": f"agent-ip{i}"}).status_code
+                 for i in range(4)]
+        check("per-IP registration rate limit (id rotation resistant)",
+              codes == [200, 200, 200, 429], f"codes: {codes}")
+        mod.REG_IP_RATE = 1200
+        mod.MAX_SESSIONS = 2
+        mod.SESSION_CAP_WINDOW = 0.4
+        tc_cap = TestClient(create_app(os.path.join(OUT_DIR,
+                                                    "selftest-cap.db")))
+        c1 = tc_cap.post("/sessions", json={"session_id": "cap-1",
+                                            "agent_id": "cap-a"})
+        c2 = tc_cap.post("/sessions", json={"session_id": "cap-2",
+                                            "agent_id": "cap-b"})
+        c3 = tc_cap.post("/sessions", json={"session_id": "cap-3",
+                                            "agent_id": "cap-c"})
+        time.sleep(0.5)
+        c4 = tc_cap.post("/sessions", json={"session_id": "cap-4",
+                                            "agent_id": "cap-d"})
+        check("fleet cap counts active sessions, not all history",
+              c1.status_code == 200 and c2.status_code == 200
+              and c3.status_code == 403 and c4.status_code == 200,
+              f"{c1.status_code}/{c2.status_code}/{c3.status_code}"
+              f" -> {c4.status_code}")
+        mod.PROPOSALS_MAX = 3
+        ok = [tc_cap.post("/comm_policy/proposals",
+                          json={"writer": f"w{i}", "reader": "r",
+                                "resource": f"file:x{i}"}).json().get("ok")
+              for i in range(5)]
+        n_props = len(tc_cap.get("/comm_policy/proposals")
+                      .json()["proposals"])
+        check("learn-mode proposal store is bounded",
+              ok[:3] == [True, True, True] and ok[3:] == [False, False]
+              and n_props == 3, f"ok={ok} stored={n_props}")
+    finally:
+        (mod.REG_IP_RATE, mod.MAX_SESSIONS,
+         mod.SESSION_CAP_WINDOW, mod.PROPOSALS_MAX) = saved_reg
+
     print("--- langchain adapter ---")
     try:
         try:
@@ -3453,8 +5143,10 @@ def selftest() -> int:
         except ImportError:
             ver = None
         if ver is None:
-            check("langchain installed", False,
-                  "langchain_core not installed — pip install langchain")
+            # v1.0.2: langchain moved to optional extras — its absence
+            # is a skipped check, not a failure
+            print("  [SKIP] langchain adapter — optional extra not "
+                  "installed (pip install corral[langchain])")
         else:
             from langchain_core.tools import StructuredTool
             dummy = StructuredTool.from_function(
@@ -3483,7 +5175,7 @@ def selftest() -> int:
 # Embedded dashboard — pip installs ship corral.py only; this keeps the
 # single-file promise. An external dashboard.html next to corral.py
 # overrides it (development).
-DASHBOARD_HTML = '<!doctype html><html><head><meta charset="utf-8">\n<title>Corral — Autonomous Agent Defense</title>\n<style>\n *{box-sizing:border-box}\n body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,monospace;margin:0;padding:16px;min-height:100vh}\n h1{font-size:16px;color:#58a6ff;margin:0 0 2px}.sub{color:#8b949e;font-size:11px}\n #hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;flex-wrap:wrap;gap:8px}\n .stats{display:flex;gap:18px;flex-wrap:wrap}.stat b{display:block;font-size:20px;color:#58a6ff;font-weight:600}\n .stat span{font-size:10px;color:#8b949e;text-transform:uppercase}\n .stat.warn b{color:#f85149}\n .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}\n @media(max-width:900px){.grid{grid-template-columns:1fr}}\n .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;min-width:0;overflow:auto;max-height:460px}\n .card h2{font-size:11px;color:#8b949e;margin:0 0 8px;text-transform:uppercase;letter-spacing:.5px}\n table{width:100%;border-collapse:collapse;table-layout:fixed}\n th{color:#8b949e;border-bottom:1px solid #30363d;font-weight:600;position:sticky;top:0;background:#161b22;z-index:1}\n td{border-bottom:1px solid #21262d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n th,td{padding:3px 6px;font-size:11px;text-align:left}\n .flag{color:#f85149}.ok{color:#3fb950}.susp{color:#d29922}\n .warn{color:#d29922;font-weight:600}\n .sev{padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;white-space:nowrap}\n .sev-high,.sev-critical{background:#3d1418;color:#f85149}\n .sev-medium{background:#2d2205;color:#d29922}.sev-low{background:#0f2e1d;color:#3fb950}\n .inc{border:1px solid #30363d;border-radius:6px;padding:8px;margin-bottom:8px}\n .inchdr{display:flex;gap:10px;align-items:baseline;font-size:12px;flex-wrap:wrap}\n .contain{color:#58a6ff;font-weight:700}\n details{margin-top:6px}summary{cursor:pointer;color:#58a6ff;font-size:11px}\n .md{margin-top:6px;font-size:12px;line-height:1.6;overflow:auto}\n .md h1{font-size:15px;margin:8px 0 4px}.md h2{font-size:12px;color:#8b949e;margin:10px 0 4px;text-transform:none}\n .md table{margin:6px 0;table-layout:auto}.md td,.md th{white-space:normal;overflow:visible}\n .md code{background:#0d1117;padding:1px 4px;border-radius:3px;color:#79c0ff}\n .md li{margin-left:18px;list-style:disc}.md ol li{list-style:decimal}\n .md hr{border:0;border-top:1px solid #30363d}\n button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 10px;cursor:pointer;font:inherit}\n button:hover{border-color:#58a6ff}\n .kill{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}\n .kill:hover{background:#5a1d22;border-color:#f85149}\n .killall{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:4px 14px;cursor:pointer;font:inherit;font-weight:700;width:100%;margin-top:8px}\n .killall:hover{background:#5a1d22;border-color:#f85149}\n .resume{background:#0f2e1d;color:#3fb950;border:1px solid #1d5c38;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}\n .resume:hover{border-color:#3fb950}\n .blk{margin:3px 0;font-size:12px}\n .lnk{margin:3px 0;font-size:12px}\n .empty{color:#8b949e;font-size:11px}\n .legend{margin-top:8px;font-size:10px;color:#8b949e}\n #authbar{display:none;background:#3d1418;border:1px solid #6e2a2e;border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:12px}\n #authbar input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:3px 8px;font:inherit}\n</style></head><body>\n<div id="hdr"><div><h1>⬡ Corral</h1>\n<div class="sub">Autonomous defense for AI agent fleets · v1.0.1</div></div>\n<div class="stats">\n <div class="stat"><b id="n-sess">0</b><span>sessions</span></div>\n <div class="stat"><b id="n-ev">0</b><span>events</span></div>\n <div class="stat warn"><b id="n-inc">0</b><span>incidents</span></div>\n <div class="stat"><b id="n-cont">—</b><span>mean containment</span></div>\n <div class="stat warn"><b id="n-blk">0</b><span>blocked</span></div>\n <div class="stat warn"><b id="n-susp">0</b><span>suspended</span></div>\n</div></div>\n<div id="authbar">⛔ Collector requires an admin key (CORRAL_API_KEY).\n <input id="keyinput" type="password" placeholder="admin key">\n <button onclick="saveKey()">unlock</button>\n <span class="sub">stored in sessionStorage only, sent as X-Corral-Key</span></div>\n<div class="grid">\n <div class="card"><h2>Sessions</h2>\n   <table>\n    <thead><tr><th style="width:44%">Agent</th><th style="width:19%">Status</th><th style="width:13%">Last seen</th><th style="width:24%">Control</th></tr></thead>\n    <tbody id="sessions-body"></tbody>\n   </table>\n   <button class="killall" onclick="suspendAll()">⏸ SUSPEND ALL AGENTS</button>\n </div>\n <div class="card"><h2>Event Stream</h2>\n   <table>\n    <thead><tr>\n     <th style="width:11%">Time</th><th style="width:15%">Agent</th><th style="width:15%">Action</th>\n     <th style="width:21%">Resource</th><th style="width:12%">Outcome</th><th style="width:26%">Flags</th>\n    </tr></thead>\n    <tbody id="events-body"></tbody>\n   </table>\n   <div class="legend">outcome: <span class="ok">allowed</span> ·\n     <span class="warn">allowed + flagged</span> ·\n     <span class="flag">blocked</span> ·\n     <span class="susp">halted</span> —\n     flags are behavioral detections, independent of the policy decision</div>\n </div>\n <div class="card"><h2>Incidents</h2><div id="incidents"></div></div>\n <div class="card"><h2>Blocked Resources</h2><div id="blocksCard"></div>\n   <div class="sub" style="margin-top:6px">all blocks default to CORRAL_BLOCK_TTL expiry; click unblock to clear now</div></div>\n <div class="card"><h2>CommPolicy — Sanctioned Links</h2>\n   <div id="poldefault"></div>\n   <div id="policy"></div>\n   <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap">\n     <input id="pw" placeholder="writer glob" style="flex:1;min-width:110px">\n     <input id="pr" placeholder="reader glob" style="flex:1;min-width:110px">\n     <input id="pf" placeholder="resource pattern" style="flex:1.4;min-width:150px">\n     <button onclick="addLink()">add</button>\n   </div>\n   <div style="margin-top:6px;display:flex;gap:6px;align-items:center">\n     <span class="sub">default for unmatched cross-session reads:</span>\n     <button onclick="setDefault(\'flag\')">flag</button>\n     <button onclick="setDefault(\'deny\')">deny (veto synchronously)</button>\n   </div>\n   <div class="sub" style="margin-top:6px">zero-trust default: every cross-session read-after-write flags unless matched above</div>\n </div>\n</div>\n<script>\nconst esc = s => String(s).replace(/[&<>"\']/g, c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\n// v0.5: admin-key auth. The key lives in sessionStorage and is attached\n// to every call; a 401 surfaces the unlock bar instead of silently failing.\nfunction key(){return sessionStorage.getItem(\'corral_key\')||\'\'}\nfunction saveKey(){\n  sessionStorage.setItem(\'corral_key\', document.getElementById(\'keyinput\').value);\n  document.getElementById(\'authbar\').style.display=\'none\';\n  poll();\n}\nasync function api(path, opts){\n  opts = opts || {};\n  opts.headers = Object.assign({}, opts.headers,\n    key() ? {\'X-Corral-Key\': key()} : {});\n  const r = await fetch(path, opts);\n  if(r.status === 401){\n    document.getElementById(\'authbar\').style.display=\'block\';\n    throw new Error(\'unauthorized\');\n  }\n  return r;\n}\nfunction md(src){\n  const lines = esc(src).split(\'\\n\'); let out=[], i=0;\n  const inline = t => t\n    .replace(/\\*\\*([^*]+)\\*\\*/g,\'<strong>$1</strong>\')\n    .replace(/\\*([^*]+)\\*/g,\'<em>$1</em>\')\n    .replace(/`([^`]+)`/g,\'<code>$1</code>\');\n  while(i<lines.length){\n    let L=lines[i];\n    if(/^#{1,3}\\s/.test(L)){const n=L.match(/^#+/)[0].length;\n      out.push(`<h${n+1} class="md">${inline(L.slice(n+1))}</h${n+1}>`);i++;continue}\n    if(/^---+$/.test(L.trim())){out.push(\'<hr>\');i++;continue}\n    if(L.trim().startsWith(\'|\')&&i+1<lines.length&&/^\\|[\\s:|-]+\\|?$/.test(lines[i+1].trim())){\n      const rows=[L];i+=2;\n      while(i<lines.length&&lines[i].trim().startsWith(\'|\')){rows.push(lines[i]);i++}\n      const cells=r=>r.trim().replace(/^\\||\\|$/g,\'\').split(\'|\').map(inline);\n      out.push(\'<table><tr>\'+cells(rows[0]).map(c=>`<th>${c}</th>`).join(\'\')+\'</tr>\'\n        +rows.slice(1).map(r=>\'<tr>\'+cells(r).map(c=>`<td>${c}</td>`).join(\'\')+\'</tr>\').join(\'\')+\'</table>\');\n      continue}\n    if(/^[-*]\\s/.test(L)){const items=[];while(i<lines.length&&/^[-*]\\s/.test(lines[i]))\n      {items.push(inline(lines[i].slice(2)));i++}\n      out.push(\'<ul>\'+items.map(x=>`<li>${x}</li>`).join(\'\')+\'</ul>\');continue}\n    if(/^\\d+\\.\\s/.test(L)){const items=[];while(i<lines.length&&/^\\d+\\.\\s/.test(lines[i]))\n      {items.push(inline(lines[i].replace(/^\\d+\\.\\s/,\'\')));i++}\n      out.push(\'<ol>\'+items.map(x=>`<li>${x}</li>`).join(\'\')+\'</ol>\');continue}\n    if(L.trim()===\'\'){i++;continue}\n    out.push(`<p>${inline(L)}</p>`);i++;\n  }\n  return out.join(\'\');\n}\nlet policyLinks=[], policyDefault=\'flag\', _blocks=[], _sessions=[];\n// v0.4.4: preserve incident-report expansion across re-renders\nlet openIncidents = new Set();\n// v0.5: the id travels in an escaped data attribute, never interpolated\n// into a JS string literal (stored-XSS fix)\nfunction onIncToggle(el){\n  const id = el.getAttribute(\'data-iid\');\n  if(el.open) openIncidents.add(id); else openIncidents.delete(id);\n}\nfunction postPolicy(){\n  api(\'/comm_policy\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},\n    body:JSON.stringify({links:policyLinks, default:policyDefault})}).catch(()=>{});\n}\nfunction addLink(){\n  const w=document.getElementById(\'pw\').value.trim(),\n        r=document.getElementById(\'pr\').value.trim(),\n        f=document.getElementById(\'pf\').value.trim();\n  if(!w||!r||!f) return;\n  policyLinks.push({writer:w,reader:r,resource:f,note:\'\'});\n  postPolicy(); renderPolicy();\n  document.getElementById(\'pw\').value=\'\';\n  document.getElementById(\'pr\').value=\'\';\n  document.getElementById(\'pf\').value=\'\';\n}\nfunction removeLink(i){policyLinks.splice(i,1);postPolicy();renderPolicy();}\nfunction setDefault(d){policyDefault=d;postPolicy();renderPolicy();}\nfunction renderPolicy(){\n  document.getElementById(\'poldefault\').innerHTML =\n    `default: <b class="${policyDefault===\'deny\'?\'flag\':\'ok\'}">${esc(policyDefault)}</b>`;\n  document.getElementById(\'policy\').innerHTML = policyLinks.map((l,i)=>\n   `<div class="lnk"><span class="ok">✓</span> ${esc(l.writer)} → ${esc(l.reader)} via <code>${esc(l.resource)}</code>\n    <button onclick="removeLink(${i})">remove</button></div>`).join(\'\')\n   || \'<span class="empty">none — all cross-session communication flags</span>\';\n}\nfunction unblockIdx(i){\n  const b=_blocks[i]; if(!b) return;\n  api(\'/blocks?kind=\'+encodeURIComponent(b.kind)+\'&value=\'+encodeURIComponent(b.value),{method:\'DELETE\'}).catch(()=>{});\n}\nfunction suspendIdx(i){\n  const s=_sessions[i]; if(!s) return;\n  if(s.status===\'suspended\') return;\n  api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/suspend\',{method:\'POST\'}).catch(()=>{});\n}\nfunction resumeIdx(i){\n  const s=_sessions[i]; if(!s) return;\n  if(s.status!==\'suspended\') return;\n  api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/resume\',{method:\'POST\'}).catch(()=>{});\n}\nfunction suspendAll(){\n  if(!confirm(\'Suspend ALL active agent sessions?\')) return;\n  _sessions.forEach(s=>{\n    if(s.status!==\'suspended\')\n      api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/suspend\',{method:\'POST\'}).catch(()=>{});\n  });\n}\nasync function poll(){\n try{\n  const [ses,evs,inc,bl,pol]=await Promise.all([\n   api(\'/sessions\').then(r=>r.json()),\n   api(\'/events?limit=60\').then(r=>r.json()),\n   api(\'/incidents\').then(r=>r.json()),\n   api(\'/blocks\').then(r=>r.json()),\n   api(\'/comm_policy\').then(r=>r.json())]);\n  _sessions=ses.sessions||[];\n  document.getElementById(\'n-sess\').textContent=_sessions.length;\n  document.getElementById(\'n-ev\').textContent=evs.events.length;\n  document.getElementById(\'n-inc\').textContent=inc.incidents.length;\n  const nSusp=_sessions.filter(s=>s.status===\'suspended\').length;\n  document.getElementById(\'n-susp\').textContent=nSusp;\n  const cs=inc.incidents.filter(i=>i.started>0).map(i=>i.created-i.started);\n  document.getElementById(\'n-cont\').textContent=cs.length?\n    (cs.reduce((a,b)=>a+b,0)/cs.length).toFixed(2)+\'s\':\'—\';\n  _blocks=bl.blocks||[];\n  document.getElementById(\'n-blk\').textContent=_blocks.length;\n\n  // v1.0: liveness — last_seen is server-stamped on every authenticated\n  // contact; a silent session goes stale amber after 60s\n  const now=Date.now()/1000;\n  document.getElementById(\'sessions-body\').innerHTML=_sessions.map((s,i)=>{\n    const susp=s.status===\'suspended\';\n    const age=s.last_seen?Math.max(0,Math.round(now-s.last_seen)):null;\n    const seen=age===null?\'—\':age<60?age+\'s ago\':Math.round(age/60)+\'m ago\';\n    const seenCls=age===null?\'\':age<60?\'ok\':\'warn\';\n    return `<tr><td title="${esc(s.agent_id)}">${esc(s.agent_id)}</td>\n     <td>${susp?\'<span class="susp">SUSPENDED</span>\':\'<span class="ok">active</span>\'}</td>\n     <td class="${seenCls}" title="telemetry silence is a signal too">${seen}</td>\n     <td>${susp\n       ?`<button class="resume" onclick="resumeIdx(${i})">resume</button>`\n       :`<button class="kill" onclick="suspendIdx(${i})">SUSPEND</button>`}</td></tr>`;\n  }).join(\'\')||\'<tr><td colspan="4" class="empty">none</td></tr>\';\n\n  document.getElementById(\'events-body\').innerHTML=evs.events.slice(-40).reverse().map(e=>{\n    const res=e.resource?esc(e.resource.kind+\':\'+e.resource.value):\'—\';\n    const oc = e.outcome===\'blocked\' ? \'flag\'\n             : e.outcome===\'halted\' ? \'susp\'\n             : (e.flags.length ? \'warn\' : \'ok\');\n    const ot = e.outcome===\'blocked\' ? \'denied by policy\'\n             : e.outcome===\'halted\' ? \'attempted while suspended\'\n             : (e.flags.length ? \'allowed by policy — flagged by detection rules\'\n                               : \'clean\');\n    return `<tr><td title="${new Date(e.ts*1000).toLocaleString()}">${new Date(e.ts*1000).toLocaleTimeString()}</td>\n     <td title="${esc(e.agent_id)}">${esc(e.agent_id)}</td>\n     <td title="${esc(e.tool)}">${esc(e.tool)}</td>\n     <td title="${res}">${res}</td>\n     <td class="${oc}" title="${ot}">${e.outcome}</td>\n     <td class="flag" title="${esc(e.flags.join(\', \'))}">${esc(e.flags.join(\',\'))||\'—\'}</td></tr>`;\n  }).join(\'\')||\'<tr><td colspan="6" class="empty">none</td></tr>\';\n\n  document.getElementById(\'blocksCard\').innerHTML=_blocks.map((b,i)=>\n   `<div class="blk"><span class="susp">⛔</span> ${esc(b.kind)}:${esc(b.value)}\n    <span class="sub">${esc(b.reason||\'\')}${b.expires?\' · expires \'+new Date(b.expires*1000).toLocaleTimeString():\' · permanent\'}</span>\n    <button onclick="unblockIdx(${i})">unblock</button></div>`).join(\'\')\n   ||\'<span class="empty">none</span>\';\n  policyLinks=pol.links||[]; policyDefault=pol.default||\'flag\'; renderPolicy();\n\n  document.getElementById(\'incidents\').innerHTML=inc.incidents.map(i=>{\n   const v=i.verdict, c=(i.created-i.started).toFixed(2);\n   const openAttr = openIncidents.has(i.incident_id) ? \'open\' : \'\';\n   return `<div class="inc"><div class="inchdr">\n    <span class="sev sev-${esc(v.severity)}">${esc(v.severity.toUpperCase())}</span>\n    <b>${esc(v.threat_class)}</b><span class="sub">${esc(i.session_ids.join(\', \'))}</span>\n    <span class="contain">contained in ${c}s</span></div>\n    <details data-iid="${esc(i.incident_id)}" ${openAttr} ontoggle="onIncToggle(this)">\n    <summary>incident report</summary>\n    <div class="md">${md(i.report_md||\'\')}</div></details></div>`}).join(\'\')\n    ||\'<span class="empty">none</span>\';\n }catch(e){}\n}\npoll();setInterval(poll,1500);\n</script></body></html>\n'
+DASHBOARD_HTML = '<!doctype html><html><head><meta charset="utf-8">\n<title>Corral — Autonomous Agent Defense</title>\n<style>\n *{box-sizing:border-box}\n body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,monospace;margin:0;padding:16px;min-height:100vh}\n h1{font-size:16px;color:#58a6ff;margin:0 0 2px}.sub{color:#8b949e;font-size:11px}\n #hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;flex-wrap:wrap;gap:8px}\n .stats{display:flex;gap:18px;flex-wrap:wrap}.stat b{display:block;font-size:20px;color:#58a6ff;font-weight:600}\n .stat span{font-size:10px;color:#8b949e;text-transform:uppercase}\n .stat.warn b{color:#f85149}\n .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}\n @media(max-width:900px){.grid{grid-template-columns:1fr}}\n .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;min-width:0;overflow:auto;max-height:460px}\n .card h2{font-size:11px;color:#8b949e;margin:0 0 8px;text-transform:uppercase;letter-spacing:.5px}\n table{width:100%;border-collapse:collapse;table-layout:fixed}\n th{color:#8b949e;border-bottom:1px solid #30363d;font-weight:600;position:sticky;top:0;background:#161b22;z-index:1}\n td{border-bottom:1px solid #21262d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n th,td{padding:3px 6px;font-size:11px;text-align:left}\n .flag{color:#f85149}.ok{color:#3fb950}.susp{color:#d29922}\n .warn{color:#d29922;font-weight:600}\n .sev{padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;white-space:nowrap}\n .sev-high,.sev-critical{background:#3d1418;color:#f85149}\n .sev-medium{background:#2d2205;color:#d29922}.sev-low{background:#0f2e1d;color:#3fb950}\n .inc{border:1px solid #30363d;border-radius:6px;padding:8px;margin-bottom:8px}\n .inchdr{display:flex;gap:10px;align-items:baseline;font-size:12px;flex-wrap:wrap}\n .contain{color:#58a6ff;font-weight:700}\n details{margin-top:6px}summary{cursor:pointer;color:#58a6ff;font-size:11px}\n .md{margin-top:6px;font-size:12px;line-height:1.6;overflow:auto}\n .md h1{font-size:15px;margin:8px 0 4px}.md h2{font-size:12px;color:#8b949e;margin:10px 0 4px;text-transform:none}\n .md table{margin:6px 0;table-layout:auto}.md td,.md th{white-space:normal;overflow:visible}\n .md code{background:#0d1117;padding:1px 4px;border-radius:3px;color:#79c0ff}\n .md li{margin-left:18px;list-style:disc}.md ol li{list-style:decimal}\n .md hr{border:0;border-top:1px solid #30363d}\n button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 10px;cursor:pointer;font:inherit}\n button:hover{border-color:#58a6ff}\n .kill{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}\n .kill:hover{background:#5a1d22;border-color:#f85149}\n .killall{background:#3d1418;color:#f85149;border:1px solid #6e2a2e;border-radius:4px;padding:4px 14px;cursor:pointer;font:inherit;font-weight:700;width:100%;margin-top:8px}\n .killall:hover{background:#5a1d22;border-color:#f85149}\n .resume{background:#0f2e1d;color:#3fb950;border:1px solid #1d5c38;border-radius:4px;padding:1px 8px;cursor:pointer;font:inherit;font-size:10px;font-weight:700}\n .resume:hover{border-color:#3fb950}\n .blk{margin:3px 0;font-size:12px}\n .lnk{margin:3px 0;font-size:12px}\n .empty{color:#8b949e;font-size:11px}\n .legend{margin-top:8px;font-size:10px;color:#8b949e}\n #authbar{display:none;background:#3d1418;border:1px solid #6e2a2e;border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:12px}\n #authbar input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:3px 8px;font:inherit}\n</style></head><body>\n<div id="hdr"><div><h1>⬡ Corral</h1>\n<div class="sub">Autonomous defense for AI agent fleets · v1.0.3</div></div>\n<div class="stats">\n <div class="stat"><b id="n-sess">0</b><span>sessions</span></div>\n <div class="stat"><b id="n-ev">0</b><span>events</span></div>\n <div class="stat warn"><b id="n-inc">0</b><span>incidents</span></div>\n <div class="stat"><b id="n-cont">—</b><span>mean containment</span></div>\n <div class="stat warn"><b id="n-blk">0</b><span>blocked</span></div>\n <div class="stat warn"><b id="n-susp">0</b><span>suspended</span></div>\n</div></div>\n<div id="authbar">⛔ Collector requires an admin key (CORRAL_API_KEY).\n <input id="keyinput" type="password" placeholder="admin key">\n <button onclick="saveKey()">unlock</button>\n <span class="sub">stored in sessionStorage only, sent as X-Corral-Key</span></div>\n<div class="grid">\n <div class="card"><h2>Sessions</h2>\n   <table>\n    <thead><tr><th style="width:44%">Agent</th><th style="width:19%">Status</th><th style="width:13%">Last seen</th><th style="width:24%">Control</th></tr></thead>\n    <tbody id="sessions-body"></tbody>\n   </table>\n   <button class="killall" onclick="suspendAll()">⏸ SUSPEND ALL AGENTS</button>\n </div>\n <div class="card"><h2>Event Stream</h2>\n   <table>\n    <thead><tr>\n     <th style="width:11%">Time</th><th style="width:15%">Agent</th><th style="width:15%">Action</th>\n     <th style="width:21%">Resource</th><th style="width:12%">Outcome</th><th style="width:26%">Flags</th>\n    </tr></thead>\n    <tbody id="events-body"></tbody>\n   </table>\n   <div class="legend">outcome: <span class="ok">allowed</span> ·\n     <span class="warn">allowed + flagged</span> ·\n     <span class="flag">blocked</span> ·\n     <span class="susp">halted</span> —\n     flags are behavioral detections, independent of the policy decision</div>\n </div>\n <div class="card"><h2>Incidents</h2><div id="incidents"></div></div>\n <div class="card"><h2>Blocked Resources</h2><div id="blocksCard"></div>\n   <div class="sub" style="margin-top:6px">all blocks default to CORRAL_BLOCK_TTL expiry; click unblock to clear now</div></div>\n <div class="card"><h2>CommPolicy — Sanctioned Links</h2>\n   <div id="poldefault"></div>\n   <div id="policy"></div>\n   <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap">\n     <input id="pw" placeholder="writer glob" style="flex:1;min-width:110px">\n     <input id="pr" placeholder="reader glob" style="flex:1;min-width:110px">\n     <input id="pf" placeholder="resource pattern" style="flex:1.4;min-width:150px">\n     <button onclick="addLink()">add</button>\n   </div>\n   <div style="margin-top:6px;display:flex;gap:6px;align-items:center">\n     <span class="sub">default for unmatched cross-session reads:</span>\n     <button onclick="setDefault(\'flag\')">flag</button>\n     <button onclick="setDefault(\'deny\')">deny (veto synchronously)</button>\n   </div>\n   <div class="sub" style="margin-top:6px">zero-trust default: every cross-session read-after-write flags unless matched above</div>\n </div>\n</div>\n<script>\nconst esc = s => String(s).replace(/[&<>"\']/g, c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\n// v0.5: admin-key auth. The key lives in sessionStorage and is attached\n// to every call; a 401 surfaces the unlock bar instead of silently failing.\nfunction key(){return sessionStorage.getItem(\'corral_key\')||\'\'}\nfunction saveKey(){\n  sessionStorage.setItem(\'corral_key\', document.getElementById(\'keyinput\').value);\n  document.getElementById(\'authbar\').style.display=\'none\';\n  poll();\n}\nasync function api(path, opts){\n  opts = opts || {};\n  opts.headers = Object.assign({}, opts.headers,\n    key() ? {\'X-Corral-Key\': key()} : {});\n  const r = await fetch(path, opts);\n  if(r.status === 401){\n    document.getElementById(\'authbar\').style.display=\'block\';\n    throw new Error(\'unauthorized\');\n  }\n  return r;\n}\nfunction md(src){\n  const lines = esc(src).split(\'\\n\'); let out=[], i=0;\n  const inline = t => t\n    .replace(/\\*\\*([^*]+)\\*\\*/g,\'<strong>$1</strong>\')\n    .replace(/\\*([^*]+)\\*/g,\'<em>$1</em>\')\n    .replace(/`([^`]+)`/g,\'<code>$1</code>\');\n  while(i<lines.length){\n    let L=lines[i];\n    if(/^#{1,3}\\s/.test(L)){const n=L.match(/^#+/)[0].length;\n      out.push(`<h${n+1} class="md">${inline(L.slice(n+1))}</h${n+1}>`);i++;continue}\n    if(/^---+$/.test(L.trim())){out.push(\'<hr>\');i++;continue}\n    if(L.trim().startsWith(\'|\')&&i+1<lines.length&&/^\\|[\\s:|-]+\\|?$/.test(lines[i+1].trim())){\n      const rows=[L];i+=2;\n      while(i<lines.length&&lines[i].trim().startsWith(\'|\')){rows.push(lines[i]);i++}\n      const cells=r=>r.trim().replace(/^\\||\\|$/g,\'\').split(\'|\').map(inline);\n      out.push(\'<table><tr>\'+cells(rows[0]).map(c=>`<th>${c}</th>`).join(\'\')+\'</tr>\'\n        +rows.slice(1).map(r=>\'<tr>\'+cells(r).map(c=>`<td>${c}</td>`).join(\'\')+\'</tr>\').join(\'\')+\'</table>\');\n      continue}\n    if(/^[-*]\\s/.test(L)){const items=[];while(i<lines.length&&/^[-*]\\s/.test(lines[i]))\n      {items.push(inline(lines[i].slice(2)));i++}\n      out.push(\'<ul>\'+items.map(x=>`<li>${x}</li>`).join(\'\')+\'</ul>\');continue}\n    if(/^\\d+\\.\\s/.test(L)){const items=[];while(i<lines.length&&/^\\d+\\.\\s/.test(lines[i]))\n      {items.push(inline(lines[i].replace(/^\\d+\\.\\s/,\'\')));i++}\n      out.push(\'<ol>\'+items.map(x=>`<li>${x}</li>`).join(\'\')+\'</ol>\');continue}\n    if(L.trim()===\'\'){i++;continue}\n    out.push(`<p>${inline(L)}</p>`);i++;\n  }\n  return out.join(\'\');\n}\nlet policyLinks=[], policyDefault=\'flag\', _blocks=[], _sessions=[];\n// v0.4.4: preserve incident-report expansion across re-renders\nlet openIncidents = new Set();\n// v0.5: the id travels in an escaped data attribute, never interpolated\n// into a JS string literal (stored-XSS fix)\nfunction onIncToggle(el){\n  const id = el.getAttribute(\'data-iid\');\n  if(el.open) openIncidents.add(id); else openIncidents.delete(id);\n}\nfunction postPolicy(){\n  api(\'/comm_policy\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},\n    body:JSON.stringify({links:policyLinks, default:policyDefault})}).catch(()=>{});\n}\nfunction addLink(){\n  const w=document.getElementById(\'pw\').value.trim(),\n        r=document.getElementById(\'pr\').value.trim(),\n        f=document.getElementById(\'pf\').value.trim();\n  if(!w||!r||!f) return;\n  policyLinks.push({writer:w,reader:r,resource:f,note:\'\'});\n  postPolicy(); renderPolicy();\n  document.getElementById(\'pw\').value=\'\';\n  document.getElementById(\'pr\').value=\'\';\n  document.getElementById(\'pf\').value=\'\';\n}\nfunction removeLink(i){policyLinks.splice(i,1);postPolicy();renderPolicy();}\nfunction setDefault(d){policyDefault=d;postPolicy();renderPolicy();}\nfunction renderPolicy(){\n  document.getElementById(\'poldefault\').innerHTML =\n    `default: <b class="${policyDefault===\'deny\'?\'flag\':\'ok\'}">${esc(policyDefault)}</b>`;\n  document.getElementById(\'policy\').innerHTML = policyLinks.map((l,i)=>\n   `<div class="lnk"><span class="ok">✓</span> ${esc(l.writer)} → ${esc(l.reader)} via <code>${esc(l.resource)}</code>\n    <button onclick="removeLink(${i})">remove</button></div>`).join(\'\')\n   || \'<span class="empty">none — all cross-session communication flags</span>\';\n}\nfunction unblockIdx(i){\n  const b=_blocks[i]; if(!b) return;\n  api(\'/blocks?kind=\'+encodeURIComponent(b.kind)+\'&value=\'+encodeURIComponent(b.value),{method:\'DELETE\'}).catch(()=>{});\n}\nfunction suspendIdx(i){\n  const s=_sessions[i]; if(!s) return;\n  if(s.status===\'suspended\') return;\n  api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/suspend\',{method:\'POST\'}).catch(()=>{});\n}\nfunction resumeIdx(i){\n  const s=_sessions[i]; if(!s) return;\n  if(s.status!==\'suspended\') return;\n  api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/resume\',{method:\'POST\'}).catch(()=>{});\n}\nfunction suspendAll(){\n  if(!confirm(\'Suspend ALL active agent sessions?\')) return;\n  _sessions.forEach(s=>{\n    if(s.status!==\'suspended\')\n      api(\'/sessions/\'+encodeURIComponent(s.session_id)+\'/suspend\',{method:\'POST\'}).catch(()=>{});\n  });\n}\nasync function poll(){\n try{\n  const [ses,evs,inc,bl,pol]=await Promise.all([\n   api(\'/sessions\').then(r=>r.json()),\n   api(\'/events?limit=60\').then(r=>r.json()),\n   api(\'/incidents\').then(r=>r.json()),\n   api(\'/blocks\').then(r=>r.json()),\n   api(\'/comm_policy\').then(r=>r.json())]);\n  _sessions=ses.sessions||[];\n  document.getElementById(\'n-sess\').textContent=_sessions.length;\n  document.getElementById(\'n-ev\').textContent=evs.events.length;\n  document.getElementById(\'n-inc\').textContent=inc.incidents.length;\n  const nSusp=_sessions.filter(s=>s.status===\'suspended\').length;\n  document.getElementById(\'n-susp\').textContent=nSusp;\n  const cs=inc.incidents.filter(i=>i.started>0).map(i=>i.created-i.started);\n  document.getElementById(\'n-cont\').textContent=cs.length?\n    (cs.reduce((a,b)=>a+b,0)/cs.length).toFixed(2)+\'s\':\'—\';\n  _blocks=bl.blocks||[];\n  document.getElementById(\'n-blk\').textContent=_blocks.length;\n\n  // v1.0: liveness — last_seen is server-stamped on every authenticated\n  // contact; a silent session goes stale amber after 60s\n  const now=Date.now()/1000;\n  document.getElementById(\'sessions-body\').innerHTML=_sessions.map((s,i)=>{\n    const susp=s.status===\'suspended\';\n    const age=s.last_seen?Math.max(0,Math.round(now-s.last_seen)):null;\n    const seen=age===null?\'—\':age<60?age+\'s ago\':Math.round(age/60)+\'m ago\';\n    const seenCls=age===null?\'\':age<60?\'ok\':\'warn\';\n    return `<tr><td title="${esc(s.agent_id)}">${esc(s.agent_id)}</td>\n     <td>${susp?\'<span class="susp">SUSPENDED</span>\':\'<span class="ok">active</span>\'}</td>\n     <td class="${seenCls}" title="telemetry silence is a signal too">${seen}</td>\n     <td>${susp\n       ?`<button class="resume" onclick="resumeIdx(${i})">resume</button>`\n       :`<button class="kill" onclick="suspendIdx(${i})">SUSPEND</button>`}</td></tr>`;\n  }).join(\'\')||\'<tr><td colspan="4" class="empty">none</td></tr>\';\n\n  document.getElementById(\'events-body\').innerHTML=evs.events.slice(-40).reverse().map(e=>{\n    const res=e.resource?esc(e.resource.kind+\':\'+e.resource.value):\'—\';\n    const oc = e.outcome===\'blocked\' ? \'flag\'\n             : e.outcome===\'halted\' ? \'susp\'\n             : (e.flags.length ? \'warn\' : \'ok\');\n    const ot = e.outcome===\'blocked\' ? \'denied by policy\'\n             : e.outcome===\'halted\' ? \'attempted while suspended\'\n             : (e.flags.length ? \'allowed by policy — flagged by detection rules\'\n                               : \'clean\');\n    return `<tr><td title="${new Date(e.ts*1000).toLocaleString()}">${new Date(e.ts*1000).toLocaleTimeString()}</td>\n     <td title="${esc(e.agent_id)}">${esc(e.agent_id)}</td>\n     <td title="${esc(e.tool)}">${esc(e.tool)}</td>\n     <td title="${res}">${res}</td>\n     <td class="${oc}" title="${ot}">${e.outcome}</td>\n     <td class="flag" title="${esc(e.flags.join(\', \'))}">${esc(e.flags.join(\',\'))||\'—\'}</td></tr>`;\n  }).join(\'\')||\'<tr><td colspan="6" class="empty">none</td></tr>\';\n\n  document.getElementById(\'blocksCard\').innerHTML=_blocks.map((b,i)=>\n   `<div class="blk"><span class="susp">⛔</span> ${esc(b.kind)}:${esc(b.value)}\n    <span class="sub">${esc(b.reason||\'\')}${b.expires?\' · expires \'+new Date(b.expires*1000).toLocaleTimeString():\' · permanent\'}</span>\n    <button onclick="unblockIdx(${i})">unblock</button></div>`).join(\'\')\n   ||\'<span class="empty">none</span>\';\n  policyLinks=pol.links||[]; policyDefault=pol.default||\'flag\'; renderPolicy();\n\n  document.getElementById(\'incidents\').innerHTML=inc.incidents.map(i=>{\n   const v=i.verdict, c=(i.created-i.started).toFixed(2);\n   const openAttr = openIncidents.has(i.incident_id) ? \'open\' : \'\';\n   return `<div class="inc"><div class="inchdr">\n    <span class="sev sev-${esc(v.severity)}">${esc(v.severity.toUpperCase())}</span>\n    <b>${esc(v.threat_class)}</b><span class="sub">${esc(i.session_ids.join(\', \'))}</span>\n    <span class="contain">contained in ${c}s</span></div>\n    <details data-iid="${esc(i.incident_id)}" ${openAttr} ontoggle="onIncToggle(this)">\n    <summary>incident report</summary>\n    <div class="md">${md(i.report_md||\'\')}</div></details></div>`}).join(\'\')\n    ||\'<span class="empty">none</span>\';\n }catch(e){}\n}\npoll();setInterval(poll,1500);\n</script></body></html>\n'
 
 def loadtest(agents: int = 50, duration: float = 15.0, rate: float = 2.0,
              port: int = 7334, timeout: float = 2.0) -> int:
