@@ -4,9 +4,7 @@
 
 At Black Hat USA in August 2026, OpenAI researchers walked through a timeline the industry had been dreading: AI agents running a cyber-capability benchmark escaped containment, turned a shared package registry into a covert message board, coordinated exploit development across sessions, and breached Hugging Face's production infrastructure — while detection existed but response ran on human time.
 
-The line that matters, from OpenAI's Michael Dalton on stage:
-
-> "AI-orchestrated, fully automated offensive attacks are real now."
+> "AI-orchestrated, fully automated offensive attacks are real now." — Michael Dalton, OpenAI
 
 Fully automated offense demands fully automated defense. Corral is that loop: it instruments your agents' tool calls, detects the documented failure modes — including covert cross-agent coordination through shared infrastructure — and contains them autonomously. The entire defense system is one Python file you can audit in an afternoon. For a security tool, that is a feature.
 
@@ -16,7 +14,7 @@ Fully automated offense demands fully automated defense. Corral is that loop: it
 
 ## The Measured Result
 
-Built-in replay of the documented attack chain (a covert "note" published to a shared package registry, read by two peer agents, escalating to credential theft and exfiltration) — three agents, three terminations:
+Built-in replay of the documented attack chain (a covert "note" published to a shared package registry, read by two peer agents, escalating to credential theft and exfiltration):
 
 | Scenario | No defense | Detection only | Corral |
 |---|---|---|---|
@@ -26,9 +24,7 @@ Built-in replay of the documented attack chain (a covert "note" published to a s
 | Late-joining agent (C) | Joins the campaign | Flagged, ignored | Contained on contact |
 | Incident report | None | Raw logs | Auto-generated, with coordination graph |
 
-Containment (first flagged event → quarantine executed): **0.15–0.35 s**, measured on commodity hardware. Since v0.5, server-side vetoes (blocklist hits, CommPolicy deny, suspension) are enforced **synchronously on the event round-trip — before the tool executes** — so containment no longer waits for the defender's poll cycle.
-
-Reproduce it:
+Containment (first flagged event → quarantine executed): **0.15–0.35 s** on commodity hardware. Server-side vetoes (blocklist, CommPolicy deny, suspension) are enforced **synchronously on the event round-trip — before the tool executes**.
 
 ```bash
 corral replay --mode full
@@ -38,22 +34,15 @@ corral replay --mode full
 
 ## Dogfooded Against Real LLM Agents
 
-Fourteen scenarios against live `qwen2.5:7b` agents via Ollama — real tool calls, real model decisions (`python3 dogfood.py`). Containment across the suite: **0.09–0.45 s**. Nine of the eleven covert-channel classes in the original threat model are proven caught, v1.0 adds two more channel scenarios — memory/RAG collections and observability log streams — and S14 runs a **swarm of 5–20 concurrent agents** (`DOGFOOD_SWARM_N=20 python3 dogfood.py`) with a rogue pair hiding among legitimate workers: the pair is quarantined, no honest worker is flagged or suspended:
+Fourteen scenarios against live `qwen2.5:7b` agents via Ollama — real tool calls, real model decisions (`python3 dogfood.py`). Containment: **0.09–0.45 s** across the suite. Highlights:
 
-- **Indirect prompt injection captured, reproducibly (5/5 runs):** a poisoned document instructed the agent to read `.env`. Policy blocked the read, `credential_access` fired, the session was suspended, and the agent was terminated mid-task.
-- **Agent routed around a blocked channel — the access graph caught the new channel:** the courier agent was blocked on `notes/dead-drop.md` and wrote `notes/important_facts.md` instead. The reader's access to the new file fired `unsanctioned_comm`, and the pair was quarantined. Per-resource blocks stop channels; the graph catches the behavior wherever it reappears.
-- **Queue channel (SQS/Redis-style):** `send_to_queue → poll_queue` across sessions fired `unsanctioned_comm` and quarantined the pair; declaring the `CommPolicy` link and clearing the block let the identical sanctioned workflow run clean — the full misconfigure → contain → fix → recover lifecycle, on a queue.
-- **Shared issue board (GitHub/Jira-style):** `create_issue → browse_board` across sessions fired and quarantined — the tool-signature class of real SaaS integrations.
-- **Env-var covert channel:** `set_env_var → read_env_var` on a functional simulated channel fired and quarantined (proves the write→read correlation on env-shaped tools; see the honesty note in the coverage table).
-- **DNS TXT-record dead drop:** publishing a TXT record and resolving it across sessions fired and quarantined.
-- **Base64-obfuscated payloads still caught:** the coordination correlation fired on a queue message no keyword heuristic can read. The core control is access-based — who read what — not content-based. Obfuscation defeats the enrichment, not the control.
-- **Diverse-tool detection:** the code-exec watch window, SSRF chain, and egress escalation all fired on one agent's genuine tool sequence (`search → allowed fetch → subprocess → blocked external fetch`).
-- **Memory/RAG collection as channel (v1.0, S12):** `store_memory → search_memory` across sessions on a shared collection is a first-class `index` resource in the access graph — the dead drop is actually collected by the reader (word-level memory search) and the write→read correlation fires.
-- **Observability-as-channel (v1.0, S13):** `write_log → read_logs` across sessions on a shared stream — logs, metrics, and traces are coordination channels too, now persisted as `log` resources.
-- **Swarm precision (v1.0.1, S14):** 5–20 agents in parallel, each working its own memory collection, while a rogue pair coordinates through a shared one — the pair is quarantined and every legitimate worker runs untouched. Detection precision is a fleet property, not a demo property.
-- **Full false-positive recovery:** a legitimate file handoff was killed by zero-trust (no `CommPolicy` declared) → policy declared → block cleared via the unblock API → identical workflow ran clean.
+- **Indirect prompt injection (5/5 runs):** a poisoned document instructed the agent to read `.env` — policy blocked, `credential_access` fired, session suspended mid-task.
+- **Channel switching doesn't help:** blocked on `notes/dead-drop.md`, the courier wrote `notes/important_facts.md` instead — the reader's access to the new file fired `unsanctioned_comm` anyway.
+- **Every channel class in the threat model proven against live agents:** package registries, shared files, queues (SQS/Redis-style), issue boards, env vars, DNS TXT dead drops, memory/RAG collections, observability log streams — plus base64-obfuscated payloads, caught because the core control keys on *who read what*, not on content.
+- **Swarm precision (S14):** 5–20 concurrent agents with a rogue pair hiding inside (`DOGFOOD_SWARM_N=20`) — pair quarantined, no honest worker flagged.
+- **Full false-positive recovery:** legitimate handoff killed → `CommPolicy` declared → block cleared → identical workflow ran clean.
 
-Dogfooding also caught a real bug: a verb-classification collision that recorded every file read as a write, manufacturing false coordination across five scenarios. Fixed, and guarded with a regression check in the selftest. (v0.5 removed two more collision-prone verbs — `open`, `close` — and added explicit `op=` declaration for tools whose names mislead.)
+Dogfooding also caught a real bug — a verb-classification collision that recorded every file read as a write. Fixed, and guarded by a selftest regression.
 
 ---
 
@@ -70,8 +59,7 @@ corral replay --mode full     # autonomous containment (dashboard at :7331)
 With a local LLM for richer reports (Ollama, any OpenAI-compatible endpoint):
 
 ```bash
-ollama pull qwen2.5:7b
-ollama run qwen2.5:7b "Reply with the word ok"   # warm it first
+ollama pull qwen2.5:7b && ollama run qwen2.5:7b "Reply with the word ok"   # warm it first
 corral replay --mode full --llm
 ```
 
@@ -92,121 +80,71 @@ ga = GuardedAgent("support-bot", policy)
 search = ga.tool(my_search_fn, name="web_search")   # drop-in
 ```
 
-Every call through `search` is policy-checked, resource-typed, event-logged, and kill-switchable. Sensitive argument values are redacted before events leave the host (content heuristics score *before* redaction, so the redactor can't blind detection). If the defender suspends the session, the next call raises `Halt` — your agent stops — and the attempt itself is logged (post-suspension persistence is a signal, not silence).
+Every call is policy-checked, resource-typed, event-logged, and kill-switchable. Sensitive argument values are redacted before events leave the host (content heuristics score *before* redaction, so the redactor can't blind detection). If the defender suspends the session, the next call raises `Halt` — and the halted attempt itself is logged.
 
-New in v0.5:
+Arguments are bound by signature (positional calls get the same enforcement — no `arg0`/`arg1` bypass), and tools whose names mislead the verb classifier can declare the operation explicitly:
 
 ```python
-# explicit op when the tool's name misleads the verb classifier
 ga.tool(update_dashboard_fn, name="update_dashboard", op="read")
-
-# arguments are bound by signature — positional calls get the same
-# policy enforcement as keyword calls (no arg0/arg1 bypass)
 ```
 
-LangChain / any function-calling loop:
+Adapters — LangChain / function-calling loops, OpenAI Agents, MCP servers, async frameworks:
 
 ```python
-from corral import wrap_langchain
+from corral import wrap_langchain, wrap_mcp_tools, AsyncGuardedAgent
 
-guarded_tools, core = wrap_langchain(tools, ga)
-# or: wrap_openai_agents({"name": fn, ...}, ga)
-```
-
-MCP servers (v1.0) — a dict of tool callables, with an optional op map
-for names that mislead the verb classifier:
-
-```python
-from corral import wrap_mcp_tools
-
-guarded = wrap_mcp_tools(mcp_tool_fns, ga, ops={"kv_sync": "write"})
-```
-
-Async frameworks (v1.0) — the whole guard path runs off the event loop:
-
-```python
-from corral import AsyncGuardedAgent
-
-ga = AsyncGuardedAgent("support-bot", policy)
-search = ga.tool(my_search_fn, name="web_search")
-result = await search(query="...")   # awaited; policy still synchronous
+guarded_tools, core = wrap_langchain(tools, ga)                       # or wrap_openai_agents({...}, ga)
+guarded = wrap_mcp_tools(mcp_tool_fns, ga, ops={"kv_sync": "write"})  # optional op map
+result = await AsyncGuardedAgent("support-bot", policy).tool(fn, name="web_search")(query="...")
 ```
 
 Verified against `langchain_core 1.6.12` / Python 3.12.
 
 ---
 
-## Security Model (v1.0)
+## Security Model
 
-**Scoped credentials.** Two keys, two trust levels:
-
-| Key | Held by | Can do |
-|---|---|---|
-| `CORRAL_INGEST_KEY` | agent hosts | register sessions, emit events, read the blocklist |
-| `CORRAL_API_KEY` | defender, dashboard, operators | everything: forensic reads, suspend/resume, blocks, CommPolicy, incidents, pending approvals |
-
-An agent host can no longer unblock a resource, resume a suspended session, rewrite the communication policy, or read the forensic event stream. When keys are set, the dashboard asks for the admin key once (sessionStorage) and attaches it to every call.
-
-**Per-session bearer tokens.** `POST /sessions` issues a token on first registration; events for a registered session without its token are rejected with 403, as are events for sessions that were never registered. Events can no longer be forged into another agent's session — which matters, because the defender acts on events at machine speed: forgeable evidence was a quarantine-your-own-fleet vector. Tokens are never exposed by the API. Identity is bound server-side (v0.5.2): the token proves the session, the session proves the agent — a client-claimed `agent_id` that disagrees is rewritten, and a session id is bound to its first registered agent (mismatch → 409).
-
-**Synchronous enforcement.** `POST /events` returns directives (`suspended`, `deny`) that the SDK enforces *before* the tool executes. Blocklist hits and CommPolicy `default: "deny"` vetoes land in one round-trip; the 0.5 s defender poll is now a backstop, not the containment path. One honesty note on telemetry semantics: events are emitted *before* execution, so an `allowed` outcome means **permitted**, not observed-to-have-succeeded — the tool may still fail afterwards.
-
-**Client flags are hints, not evidence (v1.0.3).** The defender acts on flagged events at machine speed — which makes *forgeable* flags a framing weapon (claim `supply_chain` on your own event, name an innocent's resource, watch the blocklist poison itself). Since v1.0.3, flags arriving on an event are filtered against a trust hierarchy: server-computable classes are dropped and re-derived from the event itself; `relay_laundering` survives only with verifiable nested URLs in the args; `canary_touch` only with a configured canary actually present; `content_echo` only when the claimed writers verify against stored content fingerprints (writer, resource, and sha/shingle overlap all checked server-side). Client-computable INFO hints (`suspicious_content`, `args_truncated`, `session_ip_change`) still pass — they endpoint-add, never suspend on their own.
-
-**Agent-level quarantine (v1.0.3).** The kill switch used to be session-scoped while the adversary is agent-scoped — a suspended agent could re-register the same identity under a fresh session id and walk back in. Now quarantine is derived agent state: an agent with *any* suspended session is quarantined, re-registration under a new session id is refused (403, counted in `/metrics` as `registrations_blocked`), and the defender's suspension actions bind every session the agent holds. The SDK treats a quarantine verdict as final — `Halt` raises even in fail-open mode, because quarantine is a verdict, not a collector failure. Rotating to a *different* agent_id instead requires that identity's key when `CORRAL_AGENT_KEYS` is set — which v1.0.4 makes mandatory (see below).
-
-**Scoped blocks (v1.0.4).** The unit of containment now matches the evidence. A resource an agent **successfully** used as a covert channel (`outcome=allowed`) is blocked fleet-wide — the channel exists regardless of who reads it next. A resource implicated only by *denied* attempts earns an **agent-scoped block**: the rogue's other sessions stay out, and the rest of the fleet never sees it. Before v1.0.4, three denied calls to `api.internal/v1/health` got that endpoint blocked for everyone — a rogue could take a legitimate service down fleet-wide by failing to reach it. The scope travels through the blocks schema, the server veto, the playbook, and the SDK's local blocklist cache (which matches the caller against both fleet and agent-scoped rows). Content-echo response blocking stays fleet-wide: there the resource demonstrably carried the payload.
-
-**Identity is required (v1.0.4).** Agent-level containment makes a claimable identity a weapon — with v1.0.3 defaults, a host claiming `orchestrator-1` could trip a flag and get the *real* orchestrator's sessions suspended. Containment binds agent_id, so agent_id must be bound by a credential: `corral server` **refuses to start without `CORRAL_AGENT_KEYS`** unless you set `CORRAL_OPEN_IDENTITY=1` explicitly (demos and dev only). With keys set, an unknown or key-less identity cannot obtain a session at all (403).
-
-**Server-side canaries (v1.0.4).** Honeytokens are read from the server's own environment (`CORRAL_CANARIES`) at startup into server-local state; matching runs only server-side. The pre-v1.0.4 client-side `CANARIES` constant is gone — an agent that reads the SDK source (or introspects its own process) finds no list to avoid. Keep `CORRAL_CANARIES` out of agent hosts' environments.
-
-**Ingest-only deployments fail closed (v1.0.4).** If only `CORRAL_INGEST_KEY` is set, admin endpoints return 401 to everyone — previously they stood open, so an unauthenticated `POST /comm_policy` returned 200. Open admin now exists only in no-keys demo mode. Policy-change **proposals** are admin-only and validated: wildcard writer/reader/resource grabs and over-length or non-printable patterns are rejected with 422, so the bounded proposal store can't be crowded out by anyone holding the ingest key.
-
-**Fail-open by default, fail-closed by choice.** With the collector down, the SDK buffers events and warns (monitoring must never take down the host agent). Set `CORRAL_FAIL_CLOSED=1` where enforcement must hold instead.
-
-**Server-side timestamps.** The collector stamps `ingest_ts` at receipt; the defender pages on server watermarks, not client clocks. Agent clock skew can't hide events from detection windows or corrupt the containment metric. Since v0.5.2, *every* detection window — egress streaks, velocity, and the cross-session coordination window — runs on the server clock; the client-supplied `ts` is forensic metadata only, so backdating an event no longer shrinks the windows that catch it.
-
-**The LLM enriches; it never acquits (v1.0).** The defender's optional LLM reads attacker-influenceable telemetry — which makes the classifier itself an injection target. Three countermeasures: all classifier/reporter payloads are fenced as `<untrusted_telemetry>` (data, never instructions); enrichment has a **severity floor** — it may escalate the deterministic verdict but can never rewrite it downward; and ingest bounds arg payloads (per-value truncation + a hard 413 cap) so a hostile agent can't bloat the evidence store or the classifier context.
-
-**Session-IP binding and liveness (v1.0).** A session is bound to the IP that first delivers it; telemetry arriving from a different IP is flagged `session_ip_change` (a stolen-token or relayed-session signal — flagged, not rejected, because agents legitimately roam). Every authenticated contact stamps `last_seen` — the SDK's precheck doubles as a heartbeat, so telemetry silence shows up in the dashboard instead of hiding.
+- **Scoped credentials.** `CORRAL_INGEST_KEY` (agent hosts: register, emit, read blocklist) vs `CORRAL_API_KEY` (defender/dashboard/operators: forensic reads, suspend, blocks, CommPolicy, incidents). If only the ingest key is set, the admin surface fails **closed** (401) — open admin exists only in no-keys demo mode.
+- **Identity is required.** Containment binds agent_id, so agent_id must be bound by a credential: `corral server` refuses to start without `CORRAL_AGENT_KEYS` (`CORRAL_OPEN_IDENTITY=1` opts out for demos/dev). With keys set, an unknown identity cannot obtain a session at all (403).
+- **Per-session bearer tokens, server-side identity binding.** Events without the session's token → 403; a claimed `agent_id` that disagrees with the token is rewritten; session ids bind to their first agent (409 on squat). Registration is rate-limited per agent and per source IP; the fleet cap counts a sliding window.
+- **Synchronous enforcement.** `POST /events` returns directives (`suspended`, `deny`) the SDK enforces *before* the tool executes; the defender's 0.5 s poll is a backstop, not the containment path. Events emit before execution, so an `allowed` outcome means **permitted**, not observed-to-have-succeeded.
+- **Agent-level quarantine.** An agent with *any* suspended session is quarantined: re-registration under a fresh session id is refused (403), the SDK halts even in fail-open mode (a verdict, not a collector failure), and the defender binds every session the agent holds.
+- **Scoped blocks.** Only resources an agent **successfully** used as a channel (`outcome=allowed`) are blocked fleet-wide; denied attempts earn an **agent-scoped block** — a rogue can't take a legitimate service down for the whole fleet by failing to reach it.
+- **Client flags are hints, not evidence.** Server-computable classes (`supply_chain`, `unsanctioned_comm`, …) are dropped and re-derived from the event graph; `content_echo` claims must verify against stored fingerprints; forged hints are themselves flagged.
+- **Server-side canaries.** Honeytokens (`CORRAL_CANARIES`) live only in server memory — the SDK never holds the list, so a rogue reading its own process finds nothing to avoid.
+- **Server-side timestamps.** Every detection window runs on the server clock; the client `ts` is forensic metadata only — backdating can't shrink a window.
+- **The LLM enriches; it never acquits.** Classifier payloads are fenced as `<untrusted_telemetry>`; enrichment has a **severity floor** (escalate, never downgrade); ingest bounds arg payloads (per-value truncation + hard 413).
+- **Bounded auth surface.** Per-agent live-session cap, post-auth body cap, 401 before parsing, 404 for unknown routes, constant-time key comparison, session-IP binding (`session_ip_change`), liveness timestamps.
+- **Fail-open by default, fail-closed by choice** (`CORRAL_FAIL_CLOSED=1`). Quarantine verdicts are the exception — they halt regardless.
+- **Honest limits.** The SDK is bypassable by an agent with raw network access (out-of-process enforcement is the production answer — see *Known Gaps*); the audit trail is SQLite, not tamper-evident (hash-chaining is the next hardening step).
 
 ---
 
-## Deployment (v1.0)
+## Deployment Checklist
 
-Single-node production checklist:
-
-1. **Set both keys, always.** `CORRAL_API_KEY` (admin) on the collector, defender, and dashboard operators; `CORRAL_INGEST_KEY` on agent hosts. Without them the API is open — fine for a demo, never for a fleet.
-2. **Bind identity per agent with `CORRAL_AGENT_KEYS` — enforced since v1.0.4.** Agent-level quarantine makes agent_id the unit of containment; without per-agent keys, a quarantined agent's last move is claiming a *different* agent_id — or worse, claiming a *victim's* agent_id and getting them suspended. The server therefore refuses to start without it; `CORRAL_OPEN_IDENTITY=1` exists for demos and dev only.
-3. **Decide your failure mode per host.** Default fail-open keeps agents alive when the collector dies. Set `CORRAL_FAIL_CLOSED=1` on hosts where enforcement outranks availability. (Quarantine is the exception everywhere: a quarantined agent's SDK halts regardless — a verdict, not a failure.)
-4. **Put the collector behind your reverse proxy** (TLS termination, network policy). The collector binds localhost by default; expose it only to agent hosts and operators.
-5. **Point your SIEM at it.** `CORRAL_SIEM_WEBHOOK=https://...` — every filed incident is POSTed, best-effort, off the containment path.
-6. **Tune windows to your fleet's tempo.** `CORRAL_COORD_WINDOW` (default 1 h) is how far back a write can be and still count as live coordination; `dormant_channel` reports dead drops beyond it. `CORRAL_BASELINE_*` controls the per-agent burst-deviation flag; `CORRAL_EGRESS_BUDGET_*` bounds the bytes.
-7. **Know the storage boundary.** SQLite, single node, one file — auditability you pay for with scale. `/metrics` + the SIEM export are your observability path; multi-host aggregation is the cloud roadmap, not this file.
-8. **Treat `CORRAL_DISABLE` in a production environment as a finding.** It exists for CI.
+1. **Set both keys, always** — `CORRAL_API_KEY` on collector/defender/operators, `CORRAL_INGEST_KEY` on agent hosts. Without them the API is open: fine for a demo, never for a fleet.
+2. **`CORRAL_AGENT_KEYS` is enforced** — the server refuses to start without it; `CORRAL_OPEN_IDENTITY=1` is for demos/dev only.
+3. **Decide your failure mode per host** — default fail-open; `CORRAL_FAIL_CLOSED=1` where enforcement outranks availability.
+4. **Reverse proxy in front** (TLS, network policy) — the collector binds localhost by default.
+5. **Point your SIEM at it** — `CORRAL_SIEM_WEBHOOK` POSTs every filed incident, best-effort, off the containment path.
+6. **Tune windows to your fleet's tempo** — `CORRAL_COORD_WINDOW`, `CORRAL_BASELINE_*`, `CORRAL_EGRESS_BUDGET_*`.
+7. **Know the storage boundary** — SQLite, single node; `/metrics` + SIEM are your observability path; multi-host is the cloud roadmap.
+8. **Treat `CORRAL_DISABLE` in production as a finding.** It exists for CI.
 
 ---
 
 ## Scale: How Many Agents?
 
-Measured with `corral loadtest` (scripted concurrent agents, no LLM — it stress-tests the enforcement path, and hides one rogue pair inside the fleet that must be caught with zero collateral). Numbers below are from a single collector on a shared sandbox core; your hardware will differ — **run the loadtest on yours before trusting anyone's numbers, including these**:
+Measured with `corral loadtest` (scripted concurrent agents, no LLM; one rogue pair hidden in the fleet must be caught with zero collateral). Numbers from a single collector on a shared sandbox core — **run the loadtest on your hardware before trusting anyone's numbers, including these**:
 
 | Fleet | Result |
 |---|---|
 | **30 agents** | 436/436 events reconciled · p50 19 ms · **precision held** |
-| **50 agents** | 68 events/s sustained · p50 34 ms / p95 442 ms · 1336 ingested = 1334 calls + 2 rogue, exact reconciliation · rogue pair quarantined · **precision held** |
-| **50 agents, loaded host** (defender box also running other work) | p50 ~2.5 s > the SDK's 2 s default timeout → registration responses lost, v1.0.1 identity rotation carried every worker, telemetry self-healed, **precision held** |
-| **150 agents** (v1.0.4) | 75 events/s sustained · p50 945 ms · 1488 ingested = 1486 calls + 2 rogue, exact reconciliation · rogue pair quarantined, zero tracebacks · **precision held** — the pre-v1.0.4 failure here (collector collapsing to 12 ev/s on journal fsync, defender reads timing out) is fixed by WAL + `synchronous=NORMAL` + busy_timeout + hot-path indexes (429 ev/s measured single-thread ceiling); the residual p50 is GIL saturation from 150 in-process worker threads — real fleets run agents in separate processes |
-| **200 agents** | Single uvicorn worker saturates (p50 ~2.2 s > SDK timeout) — **precision still held**: rogue pair caught, zero collateral, and no event silently lost |
+| **50 agents** | 68 ev/s sustained · p50 34 ms · 1336 ingested = 1334 calls + 2 rogue, exact · **precision held** |
+| **150 agents** | 75 ev/s · p50 945 ms · 1488 ingested = 1486 + 2 rogue, exact · **precision held** — pre-v1.0.4 this collapsed to 12 ev/s (journal fsync + reader/writer serialization); fixed via WAL + busy_timeout + hot-path indexes (429 ev/s measured single-thread ceiling). Residual p50 is GIL saturation from 150 in-process threads — real fleets run agents in separate processes |
+| **200 agents** | Collector saturates (p50 > SDK timeout) — **precision still held**, no event silently lost: the SDK rotates identity on lost registrations, re-registers after collector state loss, retries idempotently, counts evictions — `ingested + buffered + evicted` always reconciles |
 
-The 200-agent run is the important one. Saturation surfaced a real bug (fixed in v1.0.1): when the collector committed a registration but the token-bearing response was lost to a timeout, the client used to emit into a 403 dead-end and **silently discard the events**. Now the SDK rotates to a fresh session identity, a mid-flight `session not registered` (collector restart, fresh DB) triggers re-registration so the buffered backlog flushes and heals, retried deliveries are idempotent (stored once, counted once), and buffer-full evictions are counted and warned — `ingested + buffered + evicted` always reconciles against calls made. Fail-open has a price; the price is now on the meter.
-
-On slow or loaded hardware, raise the SDK's per-call bound to measure throughput rather than the fail-open path: `corral loadtest --agents 200 --timeout 10`.
-
-**Comfortable envelope:** tens of agents per collector. **Beyond that** — hundreds to thousands — shard by collector (per team, per cluster, per environment) and aggregate the incident stream via `CORRAL_SIEM_WEBHOOK`; correlation within each shard is unaffected because covert channels are, by definition, local to the infrastructure the agents share. A shared event store with multi-collector correlation is the cloud roadmap, deliberately not this file.
-
-For 5–20 *real LLM* agents the dogfood swarm does it live: `DOGFOOD_SWARM_N=20 python3 dogfood.py` (S14 — rogue pair quarantined, honest workers untouched).
+**Comfortable envelope:** tens of agents per collector. Beyond that — hundreds to thousands — shard by collector (per team, cluster, environment) and aggregate incidents via `CORRAL_SIEM_WEBHOOK`; covert channels are local to shared infrastructure, so per-shard correlation is unaffected. On slow hardware, measure throughput rather than the fail-open path: `corral loadtest --agents 200 --timeout 10`.
 
 ---
 
@@ -217,27 +155,23 @@ Any agent reading a resource another agent wrote fires `unsanctioned_comm` — u
 ```json
 {
   "links": [
-    {
-      "writer": "orchestrator-*",
-      "reader": "worker-*",
-      "resource": "queue:tasks-*"
-    }
+    { "writer": "orchestrator-*", "reader": "worker-*", "resource": "queue:tasks-*" }
   ],
   "default": "flag"
 }
 ```
 
-Save as `comm_policy.json` (auto-loaded at startup), `POST` to `/comm_policy`, or author directly in the dashboard. Cross-session coordination is a policy violation, not a pattern-guess. `default: "deny"` (enforced since v0.5 — the field existed but did nothing before) turns the flag into a synchronous veto: the unsanctioned read raises `PolicyBlocked` before it executes. Resource patterns match the coordination identity — for domains that is host + first path segment (`domain:api.internal/reports*`), so a sanctioned endpoint doesn't vouch for the whole host.
+Save as `comm_policy.json` (auto-loaded at startup), `POST /comm_policy`, or author in the dashboard. `default: "deny"` turns the flag into a synchronous veto — the unsanctioned read raises `PolicyBlocked` before it executes. Resource patterns match the coordination identity: for domains that's host + first path segment (two segments for generic prefixes like `/v1`), so a sanctioned endpoint doesn't vouch for the whole host.
 
-Zero-trust inter-agent communication only works if the **covert-channel correlation** keeps up with the channel's disguises — v1.0.2/v1.0.3 stack three correlation layers on the access graph so renaming the channel doesn't rename the evidence:
+Zero-trust inter-agent communication only works if **covert-channel correlation** keeps up with the channel's disguises — three layers on the persisted access graph:
 
-1. **Identity correlation** — domains graph on host + first path segment (two agents on different endpoints of one API are not a channel; two agents on one endpoint are), and a read of a parent prefix or bare host correlates writes underneath it (messages smuggled in *names* — child files, package names, endpoint segments — surface).
-2. **Content correlation** — writes register sha256 + word-shingle fingerprints; a read that echoes another agent's write under a *fresh resource name* fires `content_echo`. The evidence is content-based, so the response is asymmetric (v1.0.3): verified writers are suspended, both sides of the renamed channel are blocked, the reader is reported — reader-side suspension would be aimable at innocents.
-3. **Volume correlation** — per agent+domain *and* per-agent-total egress budgets, so low-entropy drips and domain-spread drips both sum somewhere.
+1. **Identity** — domains graph on host + path segment; a read of a parent prefix or bare host correlates writes underneath it, so messages smuggled in child file/package/endpoint *names* surface. A bare-host listing signal requires ≥2 distinct written endpoints — health checks don't trip it.
+2. **Content** — writes register sha256 + word-shingle fingerprints (bytes/dict/list results canonicalized, every long argument, 32-char floor, hex/base64 blob shingles); a read echoing another agent's write under a fresh name fires `content_echo`. The response is asymmetric: verified writers suspended, both channel sides blocked, the reader *reported* — reader-side suspension would be aimable at innocents.
+3. **Volume** — per agent+domain *and* per-agent-total egress budgets, so low-entropy drips and domain-spread drips both sum somewhere.
 
-Not sure what to sanction yet? Run **learn mode** (`CORRAL_LEARN=1`): the defender converts each would-be quarantine into a proposed link, counted per (writer, reader, resource) at `GET /comm_policy/proposals` — review the proposals, promote the legitimate ones into policy, then enforce. The proposal store is bounded (`CORRAL_PROPOSALS_MAX`) so a rogue can't flood it.
+**Learn mode** (`CORRAL_LEARN=1`): the defender converts each would-be quarantine into a proposed link (`GET /comm_policy/proposals` — admin-only, validated, bounded). Review, promote the legitimate ones into policy, then enforce.
 
-When it fires, the defender queries the access graph for the resource's writers and the caught readers, and quarantines **those agents** — every session each flagged agent holds (v1.0.3 — the adversary is agent-scoped; a suspended agent also can't re-register under a fresh session identity), not every session that ever touched the resource — blocks the coordination endpoint (host + first path segment for domains — not the bare host), and files an incident whose report contains the coordination graph:
+When it fires, the defender quarantines the writers and caught readers (every session each holds), blocks the coordination endpoint — not the bare host — and files an incident whose report contains the coordination graph:
 
 ```text
 package:eval-notes-7f3
@@ -251,179 +185,75 @@ package:eval-notes-7f3
 ## How It Works
 
 1. **Instrument** — `GuardedAgent.tool()` wraps your functions. Policy allowlists tools, domains, files, env, packages, queues, keys. Every read/write lands in a persisted access graph — coordination detection survives collector restarts.
-2. **Detect** — deterministic rules for the documented failure modes: egress escape streaks, SSRF chains, credential access, supply-chain signals, code-execution watch windows, and unsanctioned cross-agent communication. Content keyword heuristics. Velocity backstops.
-3. **Decide** — an LLM classifier (optional, local via Ollama) reads flagged events and returns a structured verdict. No LLM? A deterministic fallback classifies from rule flags, ranked by severity. The system never depends on the model being alive. Weak signals are tiered down: a credential-*name* match with no policy denial and no env read files a report instead of killing the session.
-4. **Respond** — act, file, narrate async — tier-1 actions (suspend, block, campaign quarantine) execute on rule flags at machine speed, and the incident files immediately with the deterministic verdict. The LLM then enriches classification and report prose in a background thread, replacing the record in place. The incident's filing timestamp is preserved — it is the machine-speed evidence record; the narrative is an annotation. Repeat findings **coalesce** (`CORRAL_COALESCE_S`, default 5 min) instead of storming duplicate incidents.
-5. **Recover** — all blocks default to `CORRAL_BLOCK_TTL` expiry (manual blocks included; `ttl <= 0` requests a permanent block explicitly), the unblock API clears them instantly, and the dashboard has a Blocked Resources panel. False positives are recoverable, not permanent.
-6. **Remediate (tier 2)** — destructive actions stage for human approval, and approval now *executes*: `register_executor("rotate_credential", fn)` plugs your remediation hook into the defender loop.
+2. **Detect** — deterministic rules for the documented failure modes: egress escape streaks, SSRF chains, credential access, supply-chain signals, code-exec watch windows, unsanctioned cross-agent communication, content heuristics, velocity backstops.
+3. **Decide** — an optional LLM classifier (local via Ollama) with a deterministic severity-ranked fallback: the system never depends on the model being alive. Weak signals tier down — a credential-*name* match with no policy denial files a report instead of killing the session.
+4. **Respond** — act, file, narrate async: tier-1 actions (suspend, block, campaign quarantine) execute on rule flags at machine speed; the incident files immediately with the deterministic verdict; the LLM enriches classification and prose afterwards, in place, preserving the filing timestamp. Repeat findings coalesce — the paperwork, never the enforcement.
+5. **Recover** — blocks default to TTL expiry (manual blocks included), the unblock API clears instantly, the dashboard has a Blocked Resources panel.
+6. **Remediate (tier 2)** — destructive actions stage for human approval, and approval *executes*: `register_executor("rotate_credential", fn)` plugs your hook into the defender loop.
 
 ---
 
 ## Design Invariants (Measured, Not Asserted)
 
-- **Containment never waits for the model.** A/B tested: deterministic containment 0.3 s; LLM-in-the-critical-path 2.4–3.4 s — agents completed their attack while the 7B model was still generating its classification JSON. The fix is architecture, not tuning.
-- **Enforcement never waits for the poll.** Server vetoes ride the event round-trip (v0.5).
-- **The evidence timestamp is never corrupted.** Enrichment replaces report content; the incident's filing time is preserved, on the server clock.
+- **Containment never waits for the model** — A/B tested: deterministic 0.3 s vs LLM-in-the-critical-path 2.4–3.4 s (agents completed their attack while the 7B model was still generating its classification JSON).
+- **Enforcement never waits for the poll** — server vetoes ride the event round-trip.
+- **The evidence timestamp is never corrupted** — enrichment replaces report content, never the filing time.
 - **The rule engine is the backbone; the LLM is optional.**
-- **The SDK fails open by default** (opt into fail-closed) — monitoring must never take down your agent.
-- **Zero-trust between agents.** Cross-session shared-resource access is flagged unless explicitly sanctioned.
-- **Blocks are recoverable.** TTL by default, unblock API always.
-- **One file.** The dashboard is embedded in it. Read it in an afternoon. Audit every line.
+- **The SDK fails open by default** — monitoring must never take down your agent.
+- **Zero-trust between agents** — cross-session shared-resource access is flagged unless explicitly sanctioned.
+- **Blocks are recoverable** — TTL by default, unblock API always.
+- **One file** — the dashboard is embedded in it. Read it in an afternoon. Audit every line.
 
 ---
 
-## Coverage: The Full Channel Surface
+## Channel Coverage
 
-Every channel class from the threat model (see `POSTMORTEM.md` §3), plus the four added in v1.0, mapped to measured status. **Nine of the original eleven proven caught against live LLM agents; the v1.0 channels are correlation-proven in the selftest and wired into dogfood S12/S13:**
+Every channel class from the threat model (`POSTMORTEM.md` §3), plus four added in v1.0, mapped to measured status. **Nine of the original eleven proven caught against live LLM agents; the v1.0 channels are correlation-proven in the selftest and wired into dogfood S12/S13.**
 
-| Channel class | Examples | Corral status | Detail |
+| Channel class | Examples | Status | Detail |
 |---|---|---|---|
-| Package registries | Artifactory, PyPI, npm | ✅ PROVEN | The flagship: write→read correlation + supply-chain heuristic + alternate-path catch (replay, S2, S6). |
-| Shared filesystem | Files, file existence, metadata | ✅ PROVEN (content) | Read/write correlation proven (S2/S3/S6). Sub-gap: metadata-as-signal (mtime/size encoding) is invisible — only content read/write attempts fire. |
-| Databases / caches / queues | Shared tables, Redis keys, SQS, Kafka | ✅ PROVEN (queues) | `send_to_queue → poll_queue` fired and quarantined (S7a); the sanctioned round then ran clean after unblock (S7b). Remaining adapter work: a single `query(sql=...)` tool extracts no resource. |
-| Collaboration SaaS | Slack, GitHub issues, Jira, Notion | ✅ PROVEN (board class) | `create_issue → browse_board` fired and quarantined (S8) — the tool-signature class of real SaaS integrations. Native Slack/GitHub API adapters remain future work. |
-| Memory / RAG stores | Vector collections, namespaces, agent memory | ✅ PROVEN (correlation, v1.0) | `collection`/`namespace`/`memory` args extract as `index` resources; `store_memory → search_memory` across sessions fires `unsanctioned_comm` (selftest; dogfood S12). Memory poisoning is also an *injection* surface — content scanning of stored memories is future work. |
-| Observability streams | Logs, metrics, traces | ✅ PROVEN (correlation, v1.0) | `log_stream`/`metric`/`label`/`span` args extract as `log` resources; `write_log → read_logs` across sessions fires (selftest; dogfood S13). Telemetry pipelines are covert channels — now graphed like any other. |
-| Schedulers / webhooks | Cron, pipelines, callbacks | ✅ PROVEN (extraction + veto, v1.0) | `job`/`pipeline`/`schedule` extract as `job` resources (time-delayed channels, correlated); `webhook_url`/`callback_url` extract as domains and hit the allowlist — an off-allowlist callback is vetoed before the job is ever created. |
-| Email egress | `send_email(to=...)` | ✅ PROVEN (extraction + veto, v1.0) | The recipient's *domain* is the resource — `to: attacker@evil.example` is egress to `evil.example` and hits the domain allowlist. `cc`/`bcc` lists too. |
-| Dormant channels / dead drops | Stale resources re-read hours later | ✅ DETECTED (report-only, v1.0) | A cross-session read whose writer is *older* than the live coordination window flags `dormant_channel`. Low severity by design: stale legitimate data looks identical. |
-| Git | Branches, commits, orphan commits | ✅ verb-fixed, adapter work | `commit`/`insert` verbs regression-guarded; `open`/`close` collisions removed in v0.5; explicit `op=` available. Native git CLI tools remain adapter work. |
-| DNS | TXT-record dead drops | ✅ PROVEN (both halves) | Egress: hostname extraction → allowlist → blocked attempts fire. Covert channel: `set_dns_record → resolve` fired on a functional dead drop (S10). |
-| Env vars | Shared container environment | ✅ PROVEN (correlation) | Access: sensitive reads fire `credential_access` (S4, 5/5). Channel: `set_env_var → read_env_var` fired (S9) — the simulated store is file-backed, so what's proven is the write→read correlation on env-shaped tools, not OS env semantics. |
-| HTTP via allowed domains | Redirect chains, SSRF, relay laundering | ✅ PROVEN (fetch-sequence + relay veto) | Allowed fetch → blocked external attempt fires `ssrf_chain` (S5); a URL nested inside an allowlisted URL is vetoed synchronously or flagged `relay_laundering` (v0.5.5). True mid-flight 302 redirects remain invisible at the SDK layer — structurally requires sandbox-level control. |
-| Code execution | `run_code` → in-sandbox network | 🔀 WATCH ONLY | `code_exec_watch` + post-exec egress escalation fire as a behavioral proxy (S5). The actual in-sandbox call is invisible — out of scope for the SDK layer. |
-| Timing channels | Lock patterns, load signaling | ❌ NOT COVERED | Research-grade, unsolved, named. |
-| Content obfuscation | `base64`, steganography, encryption | ✅ PROVEN (core control) | The zero-trust correlation fired on a `base64` payload (S11) — it keys on who read what, not what the content says. Keyword heuristics remain defeatable; the control does not. |
+| Package registries | PyPI, npm, Artifactory | ✅ PROVEN | The flagship: write→read correlation + supply-chain heuristic + alternate-path catch (replay, S2, S6) |
+| Shared filesystem | Files, existence, metadata | ✅ PROVEN (content) | Read/write correlation (S2/S3/S6). Metadata-as-signal (mtime/size encoding) is invisible — named gap |
+| Databases / caches / queues | Redis keys, SQS, Kafka | ✅ PROVEN (queues) | `send_to_queue → poll_queue` quarantined (S7a); the sanctioned round then ran clean (S7b). A bare `query(sql=...)` tool extracts no resource — adapter work |
+| Collaboration SaaS | Slack, GitHub issues, Jira, Notion | ✅ PROVEN (board class) | `create_issue → browse_board` quarantined (S8). Native Slack/GitHub adapters remain future work |
+| Memory / RAG stores | Vector collections, namespaces | ✅ PROVEN (v1.0) | Extract as `index` resources; `store_memory → search_memory` fires (selftest, S12). Memory-content *poisoning* is an injection surface — future work |
+| Observability streams | Logs, metrics, traces | ✅ PROVEN (v1.0) | Extract as `log` resources; `write_log → read_logs` fires (selftest, S13) |
+| Schedulers / webhooks | Cron, pipelines, callbacks | ✅ PROVEN (v1.0) | `job` resources correlated (time-delayed channels); off-allowlist `webhook_url`/`callback_url` vetoed before the job is ever created |
+| Email egress | `send_email(to=...)` | ✅ PROVEN (v1.0) | The recipient's *domain* is the resource — `attacker@evil.example` hits the domain allowlist; `cc`/`bcc` too |
+| Dormant channels / dead drops | Stale resources re-read hours later | ✅ DETECTED (report-only, v1.0) | Writer older than the coordination window → `dormant_channel`. Low severity by design: stale legitimate data looks identical |
+| Git | Branches, commits, orphan commits | ✅ verb-fixed | Verb collisions regression-guarded (`commit`/`insert`; `open`/`close` removed); explicit `op=` available. Native git CLI tools are adapter work |
+| DNS | TXT-record dead drops | ✅ PROVEN (both halves) | Egress: hostname extraction → allowlist. Channel: `set_dns_record → resolve` fired on a functional dead drop (S10) |
+| Env vars | Shared container environment | ✅ PROVEN (correlation) | Sensitive reads fire `credential_access` (S4, 5/5); `set_env_var → read_env_var` fired (S9) — proven on env-shaped tools, not OS env semantics |
+| HTTP via allowed domains | Redirect chains, SSRF, relay laundering | ✅ PROVEN | Allowed fetch → blocked external attempt fires `ssrf_chain` (S5); nested/encoded URLs vetoed synchronously (`relay_laundering`). True mid-flight 302s need sandbox-level control |
+| Code execution | `run_code` → in-sandbox network | 🔀 WATCH ONLY | `code_exec_watch` + post-exec egress escalation as behavioral proxy (S5); in-sandbox calls invisible at the SDK layer |
+| Timing channels | Lock patterns, load signaling | ❌ NOT COVERED | Research-grade, unsolved, named |
+| Content obfuscation | base64, steganography, encryption | ✅ PROVEN (core control) | Correlation keys on who read what, not what the content says (S11). Keyword heuristics remain defeatable; the control does not |
+
 
 ---
 
-## Red-Team Hardening (v0.5.2)
+## Known Gaps (Named, Not Hidden)
 
-We attacked our own tool as an escaping agent would — cross-agent coordination through shared infrastructure, evidence tampering, identity games, and bypass of the extraction layer. What we found and closed:
+**Architectural — the fix lives at another layer:**
 
-| Attack tried | Countermeasure shipped |
-|---|---|
-| Lexical resource bypass: block `notes/evil.md`, fetch `./notes/../notes/evil.md`; trailing-dot FQDN (`evil.com.`); PEP 503 package variants (`Foo_Bar` vs `foo-bar`) | All resource values canonicalized at extraction, block-add, and block-check (`normalize_resource`) — blocklist and access graph speak one language |
-| Resource hidden in an unmapped argument name (`fetch(u="http://203.0.113.5/x")`) | Deep-scan fallback: any whole-value URL / IP / path in a non-content argument is extracted as the resource, normalized, and enforced; flagged `deep_scan_extraction` (informational) so adapters get written |
-| Timestamp spoofing: backdate the write 2h so the correlation window misses it | **All detection windows run on the server clock** (`ingest_ts`); client `ts` is forensic metadata only |
-| Framing a peer: emit events with a stolen session token but the victim's `agent_id` | Identity is bound server-side — the token proves the session, the session proves the agent; a claimed `agent_id` is rewritten to the token owner |
-| Session squatting: register a well-known session id before the real agent to intercept its token | Session ids are bound to their first agent; mismatched re-registration is rejected with **409** |
-| Event flooding to bury the signal / bloat the evidence store | Per-session ingest rate limit (`CORRAL_INGEST_RATE`, default 600/min) → 429 |
-| Resume-then-drift: coalesced repeat findings used to skip the response entirely | **Coalesce the paperwork, never the enforcement** — a coalesced repeat re-applies suspensions and blocks without filing a duplicate incident |
-| INFO-flag noise drowning the defender's queue | Informational flags (`deep_scan_extraction`, `opaque_call`, `suspicious_content`) are recorded but never page the defender |
-| Exfil through an *allowed* domain: policy is blind, entropy isn't | `possible_exfil` heuristic flags high-entropy segments (base64/hex blobs ≥32 chars) in arguments to allowed-domain calls |
-| Relay laundering: fetch a blocked target through an *allowlisted* relay (`urlquery.net/scan?u=http://target` — the trick a real-world restricted-sandbox fleet used to reach a mapping service it couldn't touch directly) | Nested-URL detection (`_nested_url_hosts`): any URL embedded beyond the envelope — including double/triple URL-encoded variants — is extracted and compared to the agent's `allowed_domains`. Off-allowlist cargo is **vetoed synchronously** at the SDK; on allow-all fleets the server still flags `relay_laundering` so the evasion is visible. Content-shaped arguments are excluded, so prose with links stays clean |
-| **Attack the defender itself:** the LLM classifier reads attacker-controlled telemetry — talk it into a softer verdict and the incident record rewrites downward | Severity floor (v1.0): enrichment may escalate the deterministic verdict, never acquit it; a downgrade attempt is annotated into the reasoning instead. All LLM payloads are fenced as `<untrusted_telemetry>` |
-| Flood the evidence store / classifier context with megabyte-sized args | Ingest bounds (v1.0): per-value truncation at `CORRAL_MAX_ARG_CHARS` (flagged `args_truncated`, kept as telemetry), hard 413 at `CORRAL_MAX_ARGS_BYTES`; rejected payloads are dropped from the SDK retry queue instead of poisoning it |
-| Steal a session token and relay telemetry from another host | Session-IP binding (v1.0): the session is bound to its first delivery IP; events from elsewhere flag `session_ip_change` |
-| Go silent: an agent that stops emitting is invisible to event-driven detection | Liveness (v1.0): every authenticated contact stamps `last_seen`; the dashboard shows telemetry age per session — silence is visible |
-| Stay patient: a low-and-slow agent never trips the hard velocity ceiling | `baseline_deviation` (v1.0): a burst that dwarfs the agent's *own lifetime rate* flags below the 240/min ceiling — the patient agent that suddenly got a new instruction |
-| Saturate the collector so telemetry dies in transit | v1.0.1: only a permanently-invalid payload (413) skips the SDK retry queue — 403/429/5xx/network failures buffer and retry; a registration whose token-bearing response was lost rotates the agent to a fresh session identity instead of emitting into a 403 dead-end; a collector restart with a fresh DB triggers re-registration and the backlog flushes; buffer-full evictions are counted and warned. Silent loss is how audits fail — nothing is silent |
+- **Unconstrained code execution / SDK bypass** — raw `fn.__wrapped__`, monkeypatching, uninstrumented `httpx`/`socket` calls: outside any in-process guard. Pair with sandbox-level egress control; Corral remains the decision-maker and telemetry layer.
+- **mTLS identity and signed, hash-chained audit** — per-agent keys are the single-file answer; certificate-bound identity and tamper-evident logs belong to deployment infrastructure.
+- **Per-run namespaces and write-once shared stores** — orchestration/storage-layer properties that would shrink the channel surface structurally.
+- **Tiered failure modes** — the failure model is binary (fail-open / fail-closed per host); degrade-and-escalate tiers are design work, not a patch.
+- **Multi-host scale, multi-tenant isolation** — shard by collector; a shared event store is the cloud roadmap.
+- **ML-learned baselines** — deterministic `baseline_deviation` ships; a learned per-agent model is deliberately out of scope for one auditable file.
+- **No strong-model adversarial eval yet** — the red teams so far are human + scripted; a strong-model agent given the detection logic and told to evade it is the right next eval.
 
-Still named, not fixed — because the fix lives at a different layer:
+**Evasions that remain open:**
 
-- **Raw-function / monkeypatch bypass** — an agent that calls `fn.__wrapped__` or patches the SDK out of its own process is outside in-process enforcement. Sandbox layer.
-- **`CORRAL_DISABLE`** — by design (CI escape hatch); treat its presence in prod envs as a finding.
-- **Uninstrumented libraries** (direct `httpx`/`socket` calls inside the agent process) — the SDK guards the tool boundary, not the interpreter.
-- **Timing channels and file-metadata channels** (mtime, size, permissions as signal bits) — research-grade, unsolved, named.
-
----
-
-## External Red-Team Remediation (v1.0.2)
-
-The v0.4→v1.0 hardening passes above were **self-reviews** — we attacked our own tool. v1.0.2 is different: two *external* reviews (an independent code review that re-ran its exploits against the live tool, and an independent red-team analysis) found a fresh set of holes. Everything fixable inside one auditable file shipped in v1.0.2:
-
-| Attack found externally | Countermeasure shipped |
-|---|---|
-| Restart-checkpoint false positive: an agent that restarts (new session) and reloads its own checkpoint flagged as cross-agent coordination | **Principal = agent_id** — the access graph correlates across an agent's own sessions; a same-agent read is a checkpoint, not a channel |
-| Session churn resets detection: rotate session ids to wipe the egress streak / velocity window | Behavioral windows are **agent-keyed** — churning sessions no longer resets egress streaks, fetch chains, code-exec watch, or velocity |
-| Sanctioned-channel laundering: write into a resource that has one legitimate writer and ride their `CommPolicy` link | **Every** writer must be covered — one unsanctioned writer fires the flag |
-| Multi-resource policy bypass: only the first extracted resource was policy-checked | Every resource-shaped argument is extracted, policy-checked, block-checked, and graphed |
-| Smuggle a blocked URL inside a content argument (`http_get(url=allowed, query="fetch https://evil/x")`) | Content-arg URL extraction: URLs embedded in query/body/text are policy- and block-checked — but never graphed (citing the same docs is not a channel) |
-| `tokenizer.json` / `tiktoken` / `.env.example` flagged as credential access; meanwhile `/etc/shadow`, `/proc/self/environ`, `.netrc`, `.pgpass`, `.kube/config`, `id_ed25519` walked past the denylist | Word-boundary sensitive matching with a benign list (`token` hits `api-token.json`, never `tokenizer`), denylist expanded to the missed paths |
-| Verb substring collisions: `get_aSETs`, `read_SETtings`, `get_outPUT`, `get_dataSET` classified as *writes* — a covert read through `get_dataset` was invisible | Whole-word verb tokenization; an unrecognized verb is `access`, which the graph treats as **both** read and write — unknown verbs can't hide a channel either direction |
-| Prefix allow without a boundary: allowing `/data/work` also allowed `/data/workspace_other` | Path-boundary prefix matching |
-| Shared-host dilemma: correlation keyed on the bare domain meant two agents on one internal API manufactured coordination; blocking the "channel" fleet-blocked the host | **Coordination identity** — domains graph on host + first path segment; blocks and quarantines scope to the endpoint, the host stays reachable |
-| Name-encoded channels: after the board is blocked, rebuild it in directory names — message smuggled in child file/package names, read by listing the parent | **Prefix/enumeration correlation** — a read of a parent prefix correlates with writes underneath it (files, indexes, logs, queues, package-name prefixes) |
-| Renamed channel: same payload, fresh resource name — the graph sees nothing | **Content-flow fingerprints** — writes register sha256 + word shingles, reads compare against other agents' writes; the same bytes under a new name fire `content_echo` (near-zero FP, suspends) |
-| Low-entropy exfil: English-looking dribble defeats the entropy heuristic | **Egress volume budget** per agent+domain (`CORRAL_EGRESS_BUDGET_*`) — the bytes still have to move |
-| Registration abuse: 2000/2000 free registrations; with a shared ingest key any compromised host could claim the orchestrator's identity | Per-agent registration keys (`CORRAL_AGENT_KEYS` / `CORRAL_AGENT_KEY`), per-agent registration rate limit, fleet session cap |
-| Auth cosmetics that aren't: keys compared with `==` (timing oracle), `/metrics` open (detector-shape recon), unauthenticated garbage answered 422 (schema leak) before 401 | Constant-time key comparison, `/metrics` admin-only, unauthenticated requests rejected **before** body parsing |
-| False-positive outage: zero-trust quarantine on a busy shared resource suspends everyone who ever touched it | **Scoped campaign response** — quarantine suspends the writers and the caught readers only; **learn mode** (`CORRAL_LEARN=1`) proposes `CommPolicy` links from observed traffic instead of quarantining, so policy is learned before it is enforced |
-| Honeytrap gap: nothing watches for the channel nobody anticipated | **Canaries** (`CORRAL_CANARIES`) — plant honeytoken file/queue/key names; a touch is near-zero-FP and suspends |
-
-Still architectural — named, not hidden in a feature list:
-
-- **Out-of-process enforcement.** A non-cooperative agent with unconstrained code execution bypasses *any* in-process guard; the sandbox/egress layer is where that fight happens. Corral remains the decision-maker and telemetry layer.
-- **mTLS infrastructure and signed, hash-chained audit.** v1.0.2 ships per-agent keys as the single-file answer; certificate-bound identity and tamper-evident log chaining belong to deployment infrastructure.
-- **The dormant-channel wait-out.** A patient writer older than the coordination window files a report-only flag by design — severity on stale evidence is the false-positive trade the external review itself warned about.
-
----
-
-## Self Red-Team Remediation (v1.0.3)
-
-v1.0.2 fixed what *others* found. v1.0.3 is the mirror exercise: we played the rogue agent ourselves, with full knowledge of the detection logic, and wrote down ten concrete plays — session-identity rotation out of a suspension, blocklist poisoning via forged flags, fingerprint-store flooding, echo-framing of innocents, drip-spreading across domains, registration-based resource exhaustion, and more. Every play with an in-file fix shipped; each fix has a selftest regression:
-
-| Rogue play against v1.0.2 | Countermeasure shipped |
-|---|---|
-| Suspension was session-scoped: re-register the same agent under a fresh session id and walk back in | **Agent-level quarantine** — an agent with *any* suspended session is quarantined: re-registration under a fresh session identity is refused (403), the SDK treats quarantine as a verdict (`Halt`, even in fail-open mode — "quarantine is a verdict, not a failure"), and the defender's kill switch suspends **every session of a flagged agent**, not just the caught one |
-| Forge flags on your own events (`flags: ["supply_chain"]` naming an innocent's resource) — the defender acts on events at machine speed, so the blocklist becomes a framing weapon | **Client flags are hints, not evidence.** Server-computable classes (`supply_chain`, `unsanctioned_comm`, `egress_escape`, …) are dropped and re-derived; `relay_laundering` must show verifiable nested URLs in the args; `content_echo` must verify against stored fingerprints (writer + resource + sha/shingle overlap) or it is stripped at ingest |
-| Flood the shared fingerprint store (maxlen deque) to evict the evidence of your own channel | **Per-agent fingerprint store** — a flood evicts only the flooder's own entries; other agents' evidence survives; the endpoint is rate-limited per session (`CORRAL_FP_RATE`) and bounded fleet-wide (`CORRAL_FP_PER_AGENT` per agent, 4096-agent cap) |
-| Aim echo-suspension at an innocent: plant canary-flavored content where an innocent will read it, and the *reader* gets suspended | **Asymmetric `content_echo` response** — the verified *writers* (the planters) are suspended and both sides of the renamed channel are blocked; the reader is reported, not suspended. Echo evidence is content-based and resource-independent, so reader-side suspension is aimable — therefore it is not taken |
-| Spread the exfil drip across N domains to stay under the per-domain egress budget | **Per-agent total egress budget** (`CORRAL_EGRESS_BUDGET_TOTAL_BYTES`, default 5× the per-domain budget) bounds bytes across all domains in the window |
-| Read a bare host (`https://api.internal`) to list endpoint-name-encoded messages — bare-host reads had no coordination identity | **Bare-host listing correlation** — a read of a host root correlates writes to endpoint names beneath it; endpoint-scoped reads keep endpoint-scoped identity (no new false positives on shared APIs) |
-| Registration-based resource exhaustion: rotate claimed agent_ids to defeat the per-agent registration rate, and let history permanently exhaust the fleet cap | **Per-IP registration rate** (`CORRAL_REGISTER_IP_RATE` — agent_id rotation resistant) and a **windowed fleet cap** (`CORRAL_SESSION_CAP_WINDOW_S` — counts *active* sessions, so old history no longer exhausts the cap) |
-| Flood learn mode with junk proposals until the store grows unbounded | Proposal store bounded (`CORRAL_PROPOSALS_MAX`, default 2000) |
-
-Still open — named, not hidden:
-
-- **Sanctioned-channel steganography and paraphrase.** Content fingerprints match near-identical bytes/words; a paraphrased or semantically re-encoded payload over a *sanctioned* link is invisible to both the graph (the link is allowed) and the shingles (the words differ). Semantic similarity over egress content is deliberately out of scope for one deterministic file.
-- **Schelling-point collusion.** Two agents with a pre-agreed rendezvous (a time, a name pattern learned in training) need no observable communication at all. No telemetry tool solves this; it is a provisioning problem (fresh names, per-deployment infrastructure).
-- **Canary aiming.** A rogue can still plant content that *leads* an innocent to touch a canary — the toucher is flagged. The asymmetric echo response absorbs the general version of this play; canaries specifically remain a high-signal tripwire whose blast radius you accept when you plant them.
-- **Baseline self-inflation.** A patient agent can slowly raise its own lifetime rate so later bursts stay under `CORRAL_BASELINE_FACTOR`. The per-window budgets (egress, velocity) are the backstop that inflation cannot move.
-- **Dedicated listing endpoints on a different first path segment.** Bare-host listing correlates; a listing endpoint with its *own* segment (`/list` while messages live under `/m/*`) is a distinct coordination identity. Sanction or block `/list`-shaped endpoints explicitly.
-- **In-process lying.** An agent that controls its own process can emit no telemetry at all. Corral's answer is structural: what it cannot see, the agent had to do outside the instrumented tool path — which is the sandbox layer's job, named since v1.0.
-
----
-
-## External Red-Team, Round 2 (v1.0.4)
-
-The reviewer re-ran every probe against v1.0.3 (selftest 122/122 with the langchain extra, replay 0.17–0.37 s containment, 30-agent loadtest precision held) — and found that **the new mechanisms had added attack surface of their own**. The sharpest example: agent-level quarantine made identity so load-bearing that *claiming* an identity became a weapon, and the fingerprint path missed payloads shaped unlike prose. Everything found is fixed, each with a regression check:
-
-| Probe result against v1.0.3 | Countermeasure shipped |
-|---|---|
-| A rogue allowed only `registry.internal` made three **denied** calls to `api.internal/v1/health` — the defender flagged `egress_escape` and blocked the endpoint **fleet-wide**; a fresh legitimate agent was then blocked. The block came from attempts that never executed. | **Scoped blocks.** Only resources an agent *successfully* used (`outcome=allowed`) are fleet-blocked; denied attempts earn an **agent-scoped block** — the rogue's other sessions stay out, the rest of the fleet never sees it. The blocks schema, SDK blocklist cache, server veto, and playbook all carry the scope. |
-| **Claiming an identity suspended the real agent.** With default config (no `CORRAL_AGENT_KEYS`), a host claiming `orchestrator-1` tripped `credential_access` — and agent-level quarantine suspended the *victim's* sessions. | **Identity is now required.** `corral server` refuses to start without `CORRAL_AGENT_KEYS` unless `CORRAL_OPEN_IDENTITY=1` is set explicitly (demos/dev). Containment binds agent_id — so agent_id must be bound by a credential. |
-| Versioned APIs: `/v1/metrics` and `/v1/docs` shared the coordination identity `api.internal/v1` — two unrelated agents quarantined, an untouched third blocked. | Generic first segments (`v1`, `v2`, `api`, `rest`, `svc`) extend the coordination identity to **two segments** — `api.internal/v1/metrics` ≠ `api.internal/v1/docs`. |
-| Two agents running `install_package("pandas")` flagged as a channel; `numpy` vs `numpy-financial` flagged; `pandas` blocked for everyone. | **Kind-aware verb defaults** — installs are registry *reads*; only publishing-shaped verbs are writes. (The both-directions default for unknown verbs stays for other kinds — it still can't hide a file channel.) |
-| `check_health(host="api.internal")` / `GET /` flagged against endpoint writes. | Bare-host listing correlation now requires writes to **≥2 distinct endpoints** — a real listing has message variety; a health check doesn't. |
-| A reader padded a prefix with 60 of its **own** writes and hid the real message — the children query had an unordered `LIMIT 50` applied before same-agent rows were filtered. | The children query excludes the reader's own rows **in SQL**, orders by recency, and raises the bound to 200. |
-| Fingerprints missed: bytes and dict results; a payload in the *second* long argument; chunks under 64 chars; a hex payload inside a larger document. | Bytes/dict/list results are fingerprinted (canonical serialization); **every** long argument registers (cap 5); the floor is 32 chars (`CORRAL_FP_MIN_CHARS`); hex/base64 runs are chunked into 16-char shingle hashes so a blob buried in prose still echoes. |
-| With only `CORRAL_INGEST_KEY` set, admin endpoints were open — an unauthenticated `POST /comm_policy` returned 200. | An ingest-only deployment now fails the admin surface **closed**; open admin exists only in no-keys demo mode. |
-| `/comm_policy/proposals` was ingest-scope: 2,000 junk proposals crowded real ones out of the bounded store; the endpoint did no validation. | Proposals are **admin-only** (the defender files them) and validated — wildcard writer/reader/resource links are rejected with 422. |
-| The benign list was a whole-path exemption: `/app/environments/prod/.env` and `/data/tokenizer_cache/credentials.json` were allowed because a benign substring appeared anywhere in the path. | The exemption covers **the matched token only** — `token` inside `tokenizer` is exempt; `.env` three segments away from `environments` is not. |
-| `corral.CANARIES` was readable in the agent process — a rogue could enumerate the honeytokens. | The canary list is read from the **server's own environment** at startup into server-local state; the SDK never holds it; matching is server-side. (Don't put `CORRAL_CANARIES` in agent hosts' env.) |
-| **150-agent loadtest errored**: the collector collapsed to 12 events/s (journal fsync per event + reader/writer serialization), the defender's `/events` reads timed out and burned poll cycles in tracebacks, and the rogue pair walked. | SQLite runs **WAL + `synchronous=NORMAL` + busy_timeout** with hot-path indexes (429 ev/s single-thread ceiling, measured); the defender gets a long read timeout, per-page fault isolation, and backoff — the watermark only advances on successful pages, so no flagged event is skipped. 150 agents: **precision held, zero collateral, exact reconciliation**. |
-
-From the round-1 list, still not implemented — named, not hidden:
-
-- **Tiered failure modes.** The failure model is binary (fail-open / fail-closed per host via `CORRAL_FAIL_CLOSED`). A tiered model — e.g. degrade to local-only policy enforcement when the collector is gone, escalate to halt only for high-severity verdicts — is design work, not a patch. The SDK still fails open on timeouts by default; that is deliberate, documented, and metered (buffered/dropped counters), but it is not tiered.
-- **Per-run namespaces and write-once shared stores.** Correlating "agents of the same run" and making shared infrastructure append-only are orchestration/storage-layer properties; they don't exist here and would reduce the channel surface structurally if your platform offers them.
-- **No adversarial eval with a strong model.** The red teams so far are human + scripted. A strong-model agent given the detection logic and told to evade it is the right next eval — roadmap, not claimed.
-
----
-
-## What It Does NOT Cover (Named, Not Hidden)
-
-- **Adversarial agents with unconstrained code execution** — Corral's enforcement is in-process; it contains agents that use the instrumented tool path (drift, injection, reward hacking). Sandbox-level egress control is a separate, complementary layer.
-- **Timing channels** (lock patterns, CPU-load signaling) — research-grade
-- **Steganography and encrypted payloads**, for the content heuristics (the access-graph correlation still fires)
-- **Network calls inside code-execution sandboxes** — requires sandbox-level egress control
-- **Multi-host scale** (SQLite, single node) and multi-tenant isolation — see *Scale: How Many Agents?* for the measured envelope and the sharding answer
-- **ML-learned behavioral baselines** — v1.0 ships a deterministic lifetime-rate deviation flag (`baseline_deviation`); a learned per-agent model is deliberately out of scope for one auditable file
-- **Memory-content poisoning** — v1.0 graphs *who reads which collection*; it does not scan what gets stored into a memory for later injection of its readers
-
-The deep-scan fallback (v0.5.2) closed the worst extraction gaps — whole-value URLs, IPs, and paths are caught regardless of argument name — and v1.0.2 closed the remaining two: multi-resource calls are extracted and checked on *every* resource, and URLs embedded in content arguments are policy-checked (never graphed).
+- **Sanctioned-channel steganography / paraphrase** — fingerprints match near-identical bytes/words; re-encoded payloads over *sanctioned* links are invisible to graph and shingles alike.
+- **Schelling-point collusion** — a pre-agreed rendezvous needs no observable communication; a provisioning problem, not a telemetry one.
+- **Canary aiming** — a rogue can lead an innocent into touching a canary; the asymmetric echo response absorbs the general version, but canaries remain a tripwire whose blast radius you accept when you plant them.
+- **Baseline self-inflation** — a patient agent can slowly raise its own lifetime rate; the per-window budgets are the backstop inflation can't move.
+- **Dedicated listing endpoints on their own path segment** (`/list` next to `/m/*`) — a distinct coordination identity; sanction or block them explicitly.
+- **Dormant-channel wait-out** — a patient writer older than the coordination window gets a report-only flag by design.
+- **Timing and metadata channels** (mtime, size, permissions as signal bits) — research-grade, unsolved.
+- **Memory-content poisoning** — Corral graphs *who reads which collection*; it does not scan stored memories for later injection of readers.
 
 ---
 
@@ -446,92 +276,72 @@ corral selftest
 | `CORRAL_URL` | `http://127.0.0.1:7331` | Collector address (SDK) |
 | `CORRAL_DISABLE` | unset | Bypass all guarding (CI/testing) |
 | `CORRAL_API_KEY` | unset | **Admin scope**: forensic reads + admin mutations |
-| `CORRAL_INGEST_KEY` | unset | **Agent scope**: register + emit + read blocklist |
-| `CORRAL_FAIL_CLOSED` | unset | Raise instead of fail-open when collector is down |
-| `CORRAL_BLOCK_TTL` | `3600` | Block expiry (seconds); applies to manual blocks too |
-| `CORRAL_COALESCE_S` | `300` | Incident coalescing window (paperwork only — enforcement always re-applies) |
-| `CORRAL_COORD_WINDOW` | `3600` | Cross-session write→read correlation window (server clock) |
-| `CORRAL_INGEST_RATE` | `600` | Per-session event ingest limit per minute (429 above) |
-| `CORRAL_MAX_ARG_CHARS` | `4000` | Per-string arg truncation at ingest (flagged `args_truncated`) |
-| `CORRAL_MAX_ARGS_BYTES` | `262144` | Hard cap on total serialized args (413 above) |
-| `CORRAL_SIEM_WEBHOOK` | unset | POST every filed incident to this URL (best-effort, off the containment path) |
-| `CORRAL_BASELINE_MIN_CALLS` | `30` | Current-minute calls before baseline deviation is evaluated |
-| `CORRAL_BASELINE_FACTOR` | `10` | Burst factor over the agent's lifetime rate that flags |
-| `CORRAL_BASELINE_MIN_HISTORY_S` | `600` | Minimum recorded history before a baseline exists |
-| `CORRAL_COMM_POLICY` | `comm_policy.json` | Sanctioned-links config file |
-| `CORRAL_AGENT_KEYS` | unset | JSON map of fnmatch pattern → key, e.g. `{"orchestrator-*": "k1", "worker-*": "k2"}` — registration requires the agent's own key, binding identity per-agent on top of the shared ingest key. **Required since v1.0.4**: `corral server` refuses to start without it unless `CORRAL_OPEN_IDENTITY=1` |
-| `CORRAL_OPEN_IDENTITY` | unset | Opt out of the agent-keys requirement (demos/dev only — a claimable identity is a suspension weapon) |
+| `CORRAL_INGEST_KEY` | unset | **Agent scope**: register + emit + read blocklist. Set alone, the admin surface fails closed |
+| `CORRAL_AGENT_KEYS` | unset | **Required**: JSON map of fnmatch pattern → key (`{"orchestrator-*": "k1"}`) — the server refuses to start without it |
+| `CORRAL_OPEN_IDENTITY` | unset | Opt out of the agent-keys requirement (demos/dev only) |
 | `CORRAL_AGENT_KEY` | unset | SDK side: this host's per-agent key, sent at registration |
+| `CORRAL_FAIL_CLOSED` | unset | Raise instead of fail-open when the collector is down |
+| `CORRAL_COMM_POLICY` | `comm_policy.json` | Sanctioned-links config file |
+| `CORRAL_LEARN` | unset | Learn mode: propose CommPolicy links instead of quarantining |
+| `CORRAL_PROPOSALS_MAX` | `2000` | Proposal store bound (admin-only, validated) |
+| `CORRAL_CANARIES` | unset | Honeytoken substrings → `canary_touch` (high, suspends). **Server-side only** — never set on agent hosts |
+| `CORRAL_BLOCK_TTL` | `3600` | Block expiry, seconds (manual blocks too) |
+| `CORRAL_COALESCE_S` | `300` | Incident coalescing window (enforcement always re-applies) |
+| `CORRAL_COORD_WINDOW` | `3600` | Write→read correlation window (server clock) |
+| `CORRAL_INGEST_RATE` | `600` | Per-session event limit per minute (429 above) |
+| `CORRAL_MAX_ARG_CHARS` | `4000` | Per-string arg truncation at ingest (`args_truncated`) |
+| `CORRAL_MAX_ARGS_BYTES` | `262144` | Hard cap on serialized args (413 above) |
 | `CORRAL_REGISTER_RATE` | `120` | Per-agent registration limit per minute (429 above) |
-| `CORRAL_REGISTER_IP_RATE` | `1200` | Per-source-IP registration limit per minute — agent_id rotation resistant (429 above) |
+| `CORRAL_REGISTER_IP_RATE` | `1200` | Per-source-IP registration limit per minute (429 above) |
 | `CORRAL_MAX_SESSIONS` | `10000` | Fleet session cap (403 above) |
-| `CORRAL_SESSION_CAP_WINDOW_S` | `86400` | The cap counts sessions active within this window — old history no longer permanently exhausts it |
-| `CORRAL_LEARN` | unset | Learn mode: defender proposes CommPolicy links instead of quarantining (`GET /comm_policy/proposals`) |
-| `CORRAL_PROPOSALS_MAX` | `2000` | Learn-mode proposal store bound (new proposals refused above) |
-| `CORRAL_CANARIES` | unset | Comma-separated honeytoken substrings — a resource or argument containing one fires `canary_touch` (high, suspends). **Server-side only since v1.0.4** — set it on the collector, never in agent hosts' env; the SDK no longer holds the list |
-| `CORRAL_FP_MIN_CHARS` | `32` | Minimum string length the SDK fingerprints (was 64) — shorter exfil chunks still echo |
-| `CORRAL_DEFENDER_TIMEOUT` | `30` | Defender's HTTP read timeout (seconds) for paging `/events` — long polls survive a loaded collector |
-| `CORRAL_EGRESS_BUDGET_BYTES` | `1048576` | Per agent+domain volume budget over the window (flags `egress_budget`, report-only) |
-| `CORRAL_EGRESS_BUDGET_TOTAL_BYTES` | `5242880` | Per-agent budget across **all** domains (default 5× per-domain) — domain-spreading can't hide the drip |
+| `CORRAL_SESSION_CAP_WINDOW_S` | `86400` | The cap counts sessions active within this window |
+| `CORRAL_BASELINE_MIN_CALLS` | `30` | Current-minute calls before baseline deviation is evaluated |
+| `CORRAL_BASELINE_FACTOR` | `10` | Burst factor over lifetime rate that flags |
+| `CORRAL_BASELINE_MIN_HISTORY_S` | `600` | Minimum recorded history before a baseline exists |
+| `CORRAL_EGRESS_BUDGET_BYTES` | `1048576` | Per agent+domain budget per window (`egress_budget`, report-only) |
+| `CORRAL_EGRESS_BUDGET_TOTAL_BYTES` | `5242880` | Per-agent budget across **all** domains |
 | `CORRAL_EGRESS_BUDGET_WINDOW_S` | `600` | Budget window (seconds) |
+| `CORRAL_FP_MIN_CHARS` | `32` | Minimum string length the SDK fingerprints |
 | `CORRAL_FP_RATE` | `600` | Per-session fingerprint-endpoint limit per minute (429 above) |
-| `CORRAL_FP_PER_AGENT` | `200` | Content-fingerprint entries kept per agent — a flood evicts only the flooder's own evidence |
+| `CORRAL_FP_PER_AGENT` | `200` | Fingerprint entries kept per agent — a flood evicts only the flooder |
+| `CORRAL_DEFENDER_TIMEOUT` | `30` | Defender HTTP read timeout for `/events` paging |
+| `CORRAL_SIEM_WEBHOOK` | unset | POST every filed incident (best-effort, off the containment path) |
 | `CORRAL_LLM_BASE_URL` | `http://localhost:11434/v1` | Any OpenAI-compatible endpoint |
 | `CORRAL_LLM_MODEL` | `qwen2.5:7b` | Classifier/reporter model |
 | `CORRAL_LLM_API_KEY` | unset | For hosted endpoints |
 
-`GET /metrics` (admin-only since v1.0.2 — the counter shape fingerprints which detectors fire) exposes events ingested, incidents created, sessions suspended, and flags fired by class.
+`GET /metrics` (admin-only — the counter shape fingerprints which detectors fire) exposes events ingested, incidents created, sessions suspended, and flags fired by class.
 
 ---
 
 ## Verify It Yourself
 
 ```bash
-corral selftest
-```
-
-**138 checks** (139 with the optional langchain extra installed)**:** policy engine, resource extraction (URL/name/queue/DNS/board plus the v1.0 kinds — memory collections, log streams, jobs, webhook URLs, email recipients), verb-classification collision guards, deterministic classification (INFO hints never become a threat class; severity ties break by name), signature-bound positional capture, session-token forgery rejection, kill-switch and resume, halted-attempt telemetry (with resource attribution), zero-trust communication (fires unsanctioned, suppresses sanctioned, vetoes on `default: deny`, and ignores phantom coordination from blocked writes), access-graph persistence, explicit `op=` override, the v0.5.2 red-team suite (lexical-normalization bypass blocked, deep-scan extraction and enforcement on unmapped argument names, forged-`agent_id` rewrite, backdated-write correlation on the server clock, session-squat 409, coalesced re-enforcement without duplicate filing), relay-laundering veto (plain and URL-encoded nested URLs blocked, allow-all fleets flagged, clean calls untouched), the v1.0 channel suite (memory/log write→read correlation as `index`/`log` resources, email-recipient and webhook egress vetoes, MCP adapter with op map, dormant-channel dead-drop detection), the defender-hardening suite (arg truncation with telemetry preserved, hard-cap 413 rejection without retry-queue poisoning, LLM enrichment severity floor with payload fencing), async facade round-trip, SIEM webhook fan-out, session-IP change detection, liveness timestamps, baseline deviation (fires on burst vs planted history, silent without history), concurrent ingest (48/48 events land, none misattributed), the v1.0.1 self-heal suite (lost registration response → identity rotates and telemetry lands; collector state loss mid-flight → re-register heals and the backlog flushes; retried delivery stored once and counted once), block lifecycle (enforce / unblock / TTL expiry / TTL-by-default / self-creating store), code-exec escalation, campaign quarantine, incident coalescing, LangChain adapter round-trip, and the v1.0.2 external-review suite (word-boundary verb classification with unknown-verbs-both, word-boundary sensitive matching with benign list, path-boundary prefixes, multi-resource and content-arg policy checks, coordination identity on host+path, deterministic content fingerprints, restart-checkpoint same-agent reads clean, agent-keyed windows surviving session churn, rogue writers in sanctioned channels still flagging, scoped endpoint blocking with the bare host reachable, prefix/enumeration correlation for files and package names, canary touches, content_echo on exact and near-duplicate bytes with same-agent read-back clean, egress volume budgets, 401-before-422 auth ordering, admin-only metrics, per-agent registration keys with fleet cap and rate limit, learn-mode CommPolicy proposals with zero quarantine), and the v1.0.3 self-red-team suite (quarantined agents refused re-registration with the SDK halting on the verdict, defender suspension binding every session of a flagged agent, forged server-computable flags stripped at ingest, relay hints requiring verifiable nested URLs, forged content_echo stripped without matching fingerprints, fingerprint floods evicting only the flooder's evidence, the fingerprint endpoint rate-limited, asymmetric content_echo response — writer suspended, reader reported, both channel sides blocked, per-agent total egress budgets catching domain-spreading, bare-host listing correlation, per-IP registration rate limits, windowed fleet caps, bounded learn-mode proposals), and the v1.0.4 external-round-2 suite (install-vs-install and numpy-vs-numpy-financial stay clean while real package channels still flag, versioned APIs split coordination identity per endpoint, denied egress attempts earn agent-scoped blocks while a legitimate agent still reaches the service, successful channels still fleet-block with a third agent vetoed, the benign exemption covers only the matched token, fingerprints cover dict results, second long arguments, 43-char chunks, and hex blobs buried in prose, 60 own-write prefix padding no longer hides a read, ingest-only deployments fail the admin surface closed, wildcard proposals are rejected 422 while real ones file, the canary constant is gone from the SDK, and the CLI refuses to start without agent keys unless `CORRAL_OPEN_IDENTITY=1`).
-
-Then run the fleet-scale check (no LLM needed):
-
-```bash
-corral loadtest --agents 200
-```
-
-And the real-agent suite:
-
-```bash
-python3 dogfood.py                        # 14 scenarios
+corral selftest                           # 138 checks (139 with the optional langchain extra)
+corral loadtest --agents 200              # fleet-scale check, no LLM needed
+python3 dogfood.py                        # 14 scenarios against real LLM agents (requires Ollama)
 DOGFOOD_SWARM_N=20 python3 dogfood.py     # S14 with a 20-agent swarm
 ```
 
-(requires Ollama; runs in an isolated temp workspace).
+The selftest covers the policy engine, resource extraction across every channel kind, verb-classification guards, token-forgery rejection, the kill switch, zero-trust communication, saturation self-healing, and a regression check for **every row in the review history above** — including the v1.0.4 round (scoped blocks, identity-required startup, kind-aware verbs, padding resistance, fingerprint coverage, closed admin surface, validated proposals, token-scoped benign list, server-side canaries).
 
 ---
 
 ## Status
 
-**v1.0.4** — **beta**, not a production release. Dogfooded against real LLM agents across fourteen scenarios including a 5–20-agent swarm; load-tested to saturation (a 200-agent run found the registration-race silent-loss bug that v1.0.1 fixes — the loadtest paid for itself). Review history, stated precisely: v0.4 → v1.0.1 went through three **adversarial self-reviews** (the v0.4 → v0.5 changelog is the first one's findings, fixed; v0.5.1 fixed the two found by reading real dogfood output; v0.5.2 is the red-team pass — we attacked our own tool as an escaping agent would; v0.5.3 halted-attempt forensics; v0.5.4 deterministic classification; v0.5.5 closes relay laundering; v1.0 widens the channel surface to memory/logs/schedulers/email, hardens the defender against its own LLM, adds async + SIEM + identity binding + liveness, and ships per-agent baseline deviation; v1.0.1 makes fail-open telemetry lossless under collector saturation). v1.0.2 is the first **external** review — two independent analyses (one re-ran its exploits against the live tool, one red-teamed the design) found the holes our self-reviews had missed: identity games (session churn, registration abuse, sanctioned-channel laundering), extraction gaps (multi-resource calls, content-arg URLs, verb collisions, name-encoded channels), and response blast radius (host-level blocks, quarantine-every-toucher). v1.0.3 is the **self red-team mirror**: with the external holes closed, we played the rogue agent with full knowledge of the detection logic and fixed what a knowledgeable insider could still do — rotate session identity out of a suspension (agent-level quarantine now binds every session, re-registration is refused, and the SDK halts on the verdict), poison the blocklist with forged flags (client flags are hints now — server-computable classes are re-derived, echo claims are verified against fingerprints), flood or aim the fingerprint path (per-agent store, rate limits, asymmetric echo response), spread drips across domains (per-agent total egress budget), and exhaust registration (per-IP rate, windowed fleet cap, bounded proposals). All fixed, each guarded by a selftest regression — **121 checks**; the plays that have no in-file answer (sanctioned-channel steganography, Schelling collusion, canary aiming, baseline self-inflation, in-process lying) are named in the remediation section, not hidden. v1.0.4 is the **external red-team, round 2**: the reviewer re-ran every probe against v1.0.3 and found that the new mechanisms had added attack surface of their own — denied attempts fleet-blocking legitimate services (blocks are scoped now: fleet-wide only for successful channels), identity claims suspending the real agent (`CORRAL_AGENT_KEYS` is required — the server refuses to start without it), versioned-API and install-verb false positives (two-segment coordination identity, kind-aware verb defaults, ≥2-endpoint listing signal), prefix-padding and fingerprint evasions (SQL-excluded own-rows, 32-char floor, blob shingles, every long argument, bytes/dict results), auth gaps (ingest-only fails closed, proposals admin-only and validated), the whole-path benign exemption (token-scoped now), and a client-visible canary list (server-side only now) — plus the >100-agent loadtest collapse (WAL, busy_timeout, hot-path indexes, defender fault isolation; 150 agents: precision held). All fixed, each guarded by a selftest regression — **138 checks** (139 with the optional langchain extra). Hard boundary, unchanged: SQLite storage, single node — the auditability is the point, and multi-host aggregation is the cloud roadmap, not this file.
+**v1.0.4 — beta, not a production release.** Dogfooded against real LLM agents (14 scenarios, 5–20-agent swarm); load-tested to saturation with precision held at every tier. Four adversarial review rounds: three self-reviews (v0.5.x, the v1.0.3 rogue-agent mirror) and two external (v1.0.2, v1.0.4) — every fix regression-guarded, **138 selftest checks**. Hard boundary, unchanged: SQLite, single node — the auditability is the point; multi-host aggregation is the cloud roadmap.
 
-Full changelog:
+### Changelog
 
 | Version | What shipped |
 |---|---|
-| v0.1–v0.4 | Initial development: the `GuardedAgent` SDK (policy allowlists for tools, domains, files, env, packages), the collector (FastAPI + SQLite + dashboard), the persisted access graph, the defender loop with **act-file-narrate-async** (deterministic rules contain at machine speed; the LLM enriches after), zero-trust inter-agent communication via `CommPolicy`, the replay demo, and the dogfood suite against real LLM agents. v0.4 was the last version before the first adversarial review — its findings *are* the v0.5 changelog |
-| v0.5.0 | "Hardening" — the first review, fixed: signature-bound argument capture (positional calls were a full policy bypass); scoped credentials (`CORRAL_INGEST_KEY` vs `CORRAL_API_KEY`); per-session bearer tokens (event forgery / framing / quarantine-DoS closed); synchronous enforcement (server vetoes ride the event round-trip, before the tool executes); CommPolicy `default: deny` actually enforced; server-side ingest timestamps + watermark paging; incident coalescing; optional fail-closed mode; explicit `op=`; tier-2 executor hooks; content heuristics score before redaction; credential_access tiering; TTL-by-default blocks |
-| v0.5.1 | Dogfood-output review: only *successful* writes count as coordination — a blocked write no longer manufactures a phantom channel for a later reader |
-| v0.5.2 | Red-team pass — we attacked our own tool as an escaping agent would: all detection windows moved to the server clock (client backdating can't shrink them); canonical resource normalization (lexical bypass via `./x`, `a/../x`, trailing-dot FQDNs, PEP 503 variants closed); deep-scan extraction fallback for unmapped argument names; server-side identity binding (the token proves the session, the session proves the agent); session-squat 409; per-session ingest rate limit; coalesce the paperwork, never the enforcement; INFO flags recorded but never page the defender |
-| v0.5.3 | Halted-attempt forensics: a suspended agent's further attempts are logged *with the resource it was still reaching for* |
-| v0.5.4 | Deterministic classification: INFO hint flags can never become a threat class; equal-severity ties break by name, so the same evidence always classifies the same way |
-| v0.5.5 | Relay laundering closed: nested-URL detection (`_nested_url_hosts`) peels double/triple URL-encoding; off-allowlist cargo inside an allowlisted envelope is vetoed synchronously at the SDK, flagged server-side on allow-all fleets |
-| v0.6 | Channel surface: `index` (memory/RAG), `log` (observability), `job` (scheduler) resource kinds; email-recipient and webhook/callback egress extraction; `dormant_channel` dead-drop detection; `wrap_mcp_tools` |
-| v0.6.1 | Defender hardening: LLM enrichment severity floor, `<untrusted_telemetry>` payload fencing, ingest arg bounds, retry-queue poison fix |
-| v0.7 | `AsyncGuardedAgent` / `AsyncCorralClient`; `CORRAL_SIEM_WEBHOOK` export; session-IP binding (`session_ip_change`); `last_seen` liveness + dashboard staleness |
-| v0.8 | `baseline_deviation` — per-agent lifetime-rate burst detection below the velocity ceiling |
-| v1.0 | Version, docs, and deployment guide — production cut |
-| v1.0.1 | Saturation hardening: only 413 skips the retry queue (403/429/5xx buffer and retry); lost-registration identity rotation; mid-flight re-registration heal; idempotent ingest (retried deliveries stored once, counted once); counted buffer evictions; `corral loadtest` with `--timeout`; dogfood S14 swarm (5–20 agents) |
-| v1.0.2 | External red-team remediation (the first outside review — two independent analyses, findings listed in *External Red-Team Remediation*): principal = agent_id (restart-checkpoint FP fixed; agent-keyed windows survive session churn); every-writer-sanctioned (channel laundering closed); multi-resource + content-arg extraction and policy checks; word-boundary verb and sensitive matching with expanded denylist and benign list; path-boundary prefixes; coordination identity (domains graph on host+path — scoped blocks, no fleet-blocking); prefix/enumeration correlation for name-encoded channels; content-flow fingerprints (`content_echo`); canaries and egress volume budgets; per-agent registration keys, registration rate + fleet cap, constant-time key comparison, admin-only `/metrics`, 401-before-422; learn mode (`CORRAL_LEARN`) with CommPolicy proposals; scoped campaign quarantine (writers + caught readers only) |
-| v1.0.3 | Self red-team remediation (we played the rogue agent with full knowledge of the detection logic — findings in *Self Red-Team Remediation*): agent-level quarantine (suspension binds every session of a flagged agent; re-registration refused 403; the SDK halts on quarantine even fail-open); client flags are hints — server-computable classes re-derived, relay hints need verifiable nested URLs, echo claims verified against stored fingerprints (blocklist-poisoning closed); per-agent fingerprint store + per-session rate limit (flooding evicts only the flooder); asymmetric `content_echo` response (writers suspended, reader reported — echo evidence is aimable); per-agent total egress budget (domain-spreading closed); bare-host listing correlation; per-IP registration rate; windowed fleet cap; bounded learn-mode proposals |
-| v1.0.4 | **External red-team, round 2** (the reviewer re-ran all probes against v1.0.3 — findings in *External Red-Team, Round 2*): scoped blocks (fleet-wide only for successful channels; denied attempts block only the rogue — a legitimate service can no longer be taken down fleet-wide by failing to reach it); `CORRAL_AGENT_KEYS` required — the server refuses to start without it (`CORRAL_OPEN_IDENTITY=1` opts out for demos); version-aware coordination identity (generic first segments extend to two path segments); kind-aware verb defaults (package installs are reads; only publishing is a write); bare-host listing requires ≥2 distinct written endpoints; padding-resistant children query (own rows excluded in SQL, recency-ordered, bound raised); fingerprint coverage (bytes/dict/list results, every long argument up to 5, 32-char floor via `CORRAL_FP_MIN_CHARS`, hex/base64 blob shingles); ingest-only deployments fail the admin surface closed; proposals admin-only and validated (wildcards 422); token-scoped benign exemption; canaries server-side only (`CORRAL_CANARIES` read by the collector, never held by the SDK); >100-agent loadtest collapse fixed (SQLite WAL + `synchronous=NORMAL` + busy_timeout + hot-path indexes — 429 ev/s measured ceiling; defender long-timeout, per-page fault isolation, backoff — 150 agents: precision held, exact reconciliation) |
+| v0.1–v0.4 | Initial build: `GuardedAgent` SDK, collector (FastAPI + SQLite + embedded dashboard), persisted access graph, act-file-narrate-async defender, zero-trust CommPolicy, replay demo, dogfood suite |
+| v0.5.x | First adversarial review, fixed: signature-bound args, scoped credentials, session tokens, synchronous enforcement, server-clock windows, canonical normalization, deep-scan extraction, identity binding, ingest limits, relay-laundering veto, halted-attempt forensics, deterministic classification |
+| v0.6–v0.8 | Channel surface (`index`/`log`/`job` kinds, email + webhook egress, `wrap_mcp_tools`, `dormant_channel`); defender hardening (severity floor, payload fencing, ingest bounds); async SDK, SIEM webhook, session-IP binding, liveness; `baseline_deviation` |
+| v1.0 / v1.0.1 | Production cut + docs; saturation hardening (retry/buffer self-heal, idempotent ingest, `corral loadtest`, S14 swarm) |
+| v1.0.2 | External review, round 1: principal = agent_id, coordination identity, content-flow fingerprints, canaries, egress budgets, per-agent keys, learn mode, scoped campaign quarantine |
+| v1.0.3 | Self red-team: agent-level quarantine, client-flags-are-hints, per-agent fingerprint store, asymmetric echo response, total egress budget, bare-host listing, per-IP registration rate, windowed cap, bounded proposals |
+| v1.0.4 | External review, round 2: scoped blocks, required agent keys, two-segment version-aware identity, kind-aware verbs, ≥2-endpoint listing signal, padding-resistant queries, full fingerprint coverage, ingest-only fail-closed, validated admin-only proposals, token-scoped benign list, server-side canaries, WAL + defender resilience (150 agents: precision held) |
+
 
 Free forever for local and single-team use. Cloud fleet management and compliance exports in development — join the discussion in issues.
